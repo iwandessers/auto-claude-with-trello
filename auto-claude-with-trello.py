@@ -294,7 +294,8 @@ class ExtendedWorkflowAutomation:
             ['claude', '-c', '--dangerously-skip-permissions', '-p', escaped_instructions],
             cwd=worktree_path,
             capture_output=True,
-            text=True
+            text=True,
+            timeout=1800  # 30 minutes timeout
         )
         
         output = f"Claude Code Output:\n{result.stdout}"
