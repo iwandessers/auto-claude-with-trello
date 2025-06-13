@@ -30,6 +30,7 @@ import json
 import subprocess
 import time
 import re
+import argparse
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 from pathlib import Path
@@ -62,7 +63,8 @@ CARDS_STATE_DIR = os.path.join(WORKFLOW_STATE_DIR, 'cards')
 
 
 class ExtendedWorkflowAutomation:
-    def __init__(self):
+    def __init__(self, debug=False):
+        self.debug = debug
         self.ensure_directories()
         self.bb_base_url = f"https://api.bitbucket.org/2.0/repositories/{BITBUCKET_WORKSPACE}/{BITBUCKET_REPO_SLUG}"
         self.bb_headers = {
@@ -191,9 +193,8 @@ class ExtendedWorkflowAutomation:
         params = {
             'key': TRELLO_API_KEY,
             'token': TRELLO_TOKEN,
-            'fields': 'id,name,desc,dateLastActivity',
-            'actions': 'commentCard',
-            'actions_limit': 1000
+            'fields': 'id,name,desc,dateLastActivity'
+            # Removed 'actions' and 'actions_limit' - we fetch comments separately
         }
         
         response = requests.get(url, params=params)
@@ -287,11 +288,18 @@ class ExtendedWorkflowAutomation:
     
     def execute_claude_code(self, instructions: str, worktree_path: str) -> str:
         """Execute instructions using Claude Code in the specified directory."""
+        # Debug logging
+        if self.debug:
+            print(f"\n[DEBUG] Executing Claude Code with instruction length: {len(instructions)} characters")
+            print(f"[DEBUG] First 200 chars of instruction: {instructions[:200]}...")
+            if len(instructions) > 10000:
+                print(f"[WARNING] Very long instruction detected: {len(instructions)} characters!")
+        
         # Escape quotes in instructions for shell command
         escaped_instructions = instructions.replace('"', '\\"')
         
         result = subprocess.run(
-            ['claude', '-c', '--dangerously-skip-permissions', '-p', escaped_instructions],
+            ['claude', '--dangerously-skip-permissions', '-p', escaped_instructions],
             cwd=worktree_path,
             capture_output=True,
             text=True,
@@ -301,6 +309,9 @@ class ExtendedWorkflowAutomation:
         output = f"Claude Code Output:\n{result.stdout}"
         if result.stderr.strip():
             output += f"\n\nErrors (if any):\n{result.stderr}"
+            # Check for specific error
+            if "Prompt is too long" in result.stderr and self.debug:
+                print(f"[ERROR] Claude reported 'Prompt is too long' for instruction of {len(instructions)} characters")
         return output
     
     def commit_and_push(self, worktree_path: str, message: str, card_id: str) -> Tuple[str, Optional[str]]:
@@ -627,19 +638,24 @@ def cleanup_worktrees():
 
 def main():
     """Run the workflow once or in a loop."""
+    parser = argparse.ArgumentParser(description='Trello and BitBucket automation workflow')
+    parser.add_argument('--loop', action='store_true', help='Run in loop mode')
+    parser.add_argument('--cleanup', action='store_true', help='Clean up worktrees only')
+    parser.add_argument('--debug', action='store_true', help='Enable debug output')
+    args = parser.parse_args()
     
     # Clean up any orphaned worktrees on startup
     cleanup_worktrees()
     
-    automation = ExtendedWorkflowAutomation()
+    automation = ExtendedWorkflowAutomation(debug=args.debug)
     
-    if len(sys.argv) > 1 and sys.argv[1] == '--loop':
+    if args.loop:
         print("Running in loop mode. Press Ctrl+C to stop.")
         while True:
             automation.run()
             print("\nWaiting 60 seconds before next check...")
             time.sleep(60)
-    elif len(sys.argv) > 1 and sys.argv[1] == '--cleanup':
+    elif args.cleanup:
         print("Cleaning up worktrees only...")
         cleanup_worktrees()
     else:
