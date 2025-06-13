@@ -241,6 +241,14 @@ class ExtendedWorkflowAutomation:
         """Create a new git worktree for the branch."""
         worktree_path = os.path.join(WORKTREE_BASE_DIR, f"{card_id}_{branch_name.replace('/', '_')}")
         
+        # Fetch latest from origin before creating branch
+        print("Fetching latest from origin before any operations...")
+        subprocess.run(
+            ['git', 'fetch', 'origin'],
+            cwd=GIT_REPO_PATH,
+            capture_output=True
+        )
+        
         # Create branch in the main repo
         result = subprocess.run(
             ['git', 'branch', branch_name],
@@ -268,6 +276,14 @@ class ExtendedWorkflowAutomation:
     def checkout_worktree(self, branch_name: str, card_id: str) -> str:
         """Checkout existing worktree or create if missing."""
         worktree_path = os.path.join(WORKTREE_BASE_DIR, f"{card_id}_{branch_name.replace('/', '_')}")
+        
+        # Fetch latest from origin before any operations
+        print("Fetching latest from origin before any operations...")
+        subprocess.run(
+            ['git', 'fetch', 'origin'],
+            cwd=GIT_REPO_PATH,
+            capture_output=True
+        )
         
         if not os.path.exists(worktree_path):
             # Recreate worktree if it was deleted
