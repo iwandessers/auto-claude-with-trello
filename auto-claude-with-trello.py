@@ -72,6 +72,8 @@ class ExtendedWorkflowAutomation:
             'Accept': 'application/json',
             'Content-Type': 'application/json'
         } if BITBUCKET_ACCESS_TOKEN else None
+        # Unique identifier for bot-generated comments
+        self.bot_signature = "[auto-claude-bot:processed]"
         
     def ensure_directories(self):
         """Create necessary directories if they don't exist."""
@@ -88,7 +90,14 @@ class ExtendedWorkflowAutomation:
         state_file = self.get_card_state_file(card_id)
         if os.path.exists(state_file):
             with open(state_file, 'r') as f:
-                return json.load(f)
+                state = json.load(f)
+                # Ensure processed_pr_comments exists and contains only strings
+                if 'processed_pr_comments' not in state:
+                    state['processed_pr_comments'] = []
+                else:
+                    # Ensure all IDs are strings for consistency
+                    state['processed_pr_comments'] = [str(id) for id in state['processed_pr_comments']]
+                return state
         return {
             'card_id': card_id,
             'branch': None,
@@ -96,7 +105,7 @@ class ExtendedWorkflowAutomation:
             'pr_id': None,
             'last_update': None,
             'processed_comments': [],
-            'processed_pr_comments': [],
+            'processed_pr_comments': [],  # List of string IDs of processed PR comments
             'created_at': datetime.now().isoformat()
         }
     
@@ -104,6 +113,12 @@ class ExtendedWorkflowAutomation:
         """Save state for a specific card."""
         state_file = self.get_card_state_file(card_id)
         state['last_update'] = datetime.now().isoformat()
+        
+        if self.debug:
+            print(f"[DEBUG] Saving state for card {card_id}")
+            print(f"[DEBUG] Processed Trello comments: {len(state.get('processed_comments', []))} IDs")
+            print(f"[DEBUG] Processed PR comments: {len(state.get('processed_pr_comments', []))} IDs")
+        
         with open(state_file, 'w') as f:
             json.dump(state, f, indent=2)
     
@@ -164,27 +179,21 @@ class ExtendedWorkflowAutomation:
         return None
     
     def get_pr_comments(self, pr_id: int) -> List[Dict]:
-        """Fetch all comments from a BitBucket PR."""
+        """Fetch all comments from a BitBucket PR and filter for unresolved inline comments."""
         if not self.bb_headers:
             return []
             
         url = f"{self.bb_base_url}/pullrequests/{pr_id}/comments"
-        comments = []
-        initial_request = True # Flag for the first request
+        all_comments = []
         
         try:
             while url:
-                if initial_request:
-                    params = {'pagelen': 50}
-                    response = requests.get(url, headers=self.bb_headers, params=params)
-                    initial_request = False # Unset flag after first request
-                else:
-                    # Subsequent requests use the 'next' URL which includes pagination parameters
-                    response = requests.get(url, headers=self.bb_headers)
+                params = {'pagelen': 50} if 'pagelen' not in url else None
+                response = requests.get(url, headers=self.bb_headers, params=params)
 
                 if response.status_code == 200:
                     data = response.json()
-                    comments.extend(data.get('values', []))
+                    all_comments.extend(data.get('values', []))
                     url = data.get('next')
                 else:
                     # Log error for non-200 responses if needed, then break
@@ -205,8 +214,29 @@ class ExtendedWorkflowAutomation:
                 except ValueError: # Not a JSON response
                     error_message += f" - Status: {e.response.status_code}, Content: {e.response.text[:200]}"
             print(error_message)
+        
+        # Manual filtering for unresolved inline comments
+        filtered_comments = []
+        for comment in all_comments:
+            # Check if it's an inline comment
+            has_inline = comment.get('inline') is not None
+            
+            # Check if it's resolved
+            is_resolved = comment.get('resolved', False)
+            
+            # Check if inline comment is outdated (if inline exists)
+            is_outdated = False
+            if has_inline:
+                inline_data = comment.get('inline', {})
+                is_outdated = inline_data.get('outdated', False)
+            
+            # Include comment if:
+            # 1. It's an inline comment that's not outdated and not resolved
+            # 2. OR it's a general comment (not inline) that's not resolved
+            if (has_inline and not is_outdated and not is_resolved) or (not has_inline and not is_resolved):
+                filtered_comments.append(comment)
                     
-        return comments
+        return filtered_comments
     
     def add_pr_comment(self, pr_id: int, comment: str):
         """Add a comment to a BitBucket PR."""
@@ -355,7 +385,7 @@ class ExtendedWorkflowAutomation:
         # Debug logging
         if self.debug:
             print(f"\n[DEBUG] Executing Claude Code with instruction length: {len(instructions)} characters")
-            print(f"[DEBUG] First 200 chars of instruction: {instructions[:200]}...")
+            print(f"[DEBUG] First 500 chars of instruction: {instructions[:500]}...")
             if len(instructions) > 10000:
                 print(f"[WARNING] Very long instruction detected: {len(instructions)} characters!")
         
@@ -488,7 +518,7 @@ Git Operations:
 {commit_output}
 ```
 
-"""
+{self.bot_signature}"""
         
         if pr_url:
             comment += f"\n📄 Create Pull Request: {pr_url}"
@@ -519,15 +549,8 @@ Git Operations:
         for comment in new_comments:
             comment_text = comment['data']['text']
             
-            # Skip bot comments - check multiple indicators
-            is_bot_comment = (
-                '🤖' in comment_text or
-                'Automated Workflow Update:' in comment_text or
-                'Processed BitBucket PR comment:' in comment_text or
-                'Processed Trello comment update:' in comment_text or
-                'Claude Code Response' in comment_text or
-                'Claude Code Output:' in comment_text
-            )
+            # Skip bot comments - check for bot signature
+            is_bot_comment = self.bot_signature in comment_text
             
             if is_bot_comment:
                 print(f"Skipping Trello comment (bot comment detected)")
@@ -553,7 +576,8 @@ Git Operations:
 ```
 
 Pull Request: {card_state.get('pr_url', 'Create PR manually from BitBucket')}
-"""
+
+{self.bot_signature}"""
             
             self.add_comment_to_card(card_id, response_comment)
             card_state['processed_comments'].append(comment['id'])
@@ -582,8 +606,19 @@ Pull Request: {card_state.get('pr_url', 'Create PR manually from BitBucket')}
         pr_comments = self.get_pr_comments(pr_id)
         
         # Filter for new comments
-        processed_pr_ids = set(card_state.get('processed_pr_comments', []))
+        # Ensure all processed IDs are strings for consistent comparison
+        processed_pr_ids = set(str(id) for id in card_state.get('processed_pr_comments', []))
         new_pr_comments = [c for c in pr_comments if str(c['id']) not in processed_pr_ids]
+        
+        if self.debug:
+            print(f"[DEBUG] Card ID: {card_id}")
+            print(f"[DEBUG] Card state loaded with {len(card_state.get('processed_pr_comments', []))} processed PR comment IDs")
+            print(f"[DEBUG] PR Comments - Total: {len(pr_comments)}, Already processed: {len(processed_pr_ids)}, New: {len(new_pr_comments)}")
+            print(f"[DEBUG] Processed PR comment IDs from state: {sorted(processed_pr_ids)}")
+            if pr_comments:
+                print(f"[DEBUG] Current PR comment IDs: {sorted([str(c['id']) for c in pr_comments])}")
+            if new_pr_comments:
+                print(f"[DEBUG] New PR comment IDs to process: {sorted([str(c['id']) for c in new_pr_comments])}")
         
         if not new_pr_comments:
             return
@@ -593,74 +628,65 @@ Pull Request: {card_state.get('pr_url', 'Create PR manually from BitBucket')}
         worktree_path = self.checkout_worktree(branch_name, card_id)
         
         for comment in new_pr_comments:
-            # Extract all comment information
-            comment_text = comment.get('content', {}).get('raw', '')
-            comment_html = comment.get('content', {}).get('html', '')
-            comment_markup = comment.get('content', {}).get('markup', '')
-            
-            # Extract author information
-            author_info = comment.get('user', {})
-            author_display_name = author_info.get('display_name', 'Unknown')
-            author_username = author_info.get('username', '')
-            author_uuid = author_info.get('uuid')
-            author_account_id = author_info.get('account_id', '')
-            
-            # Extract metadata
+            # Extract metadata first to always have comment_id
             comment_id = str(comment['id'])
-            created_on = comment.get('created_on', '')
-            updated_on = comment.get('updated_on', '')
             
-            # Extract parent comment info if this is a reply
-            parent_id = comment.get('parent', {}).get('id', '') if comment.get('parent') else ''
-            
-            # Extract inline info if this is an inline comment
-            inline_info = comment.get('inline', {})
-            inline_path = inline_info.get('path', '') if inline_info else ''
-            inline_from = inline_info.get('from', '') if inline_info else ''
-            inline_to = inline_info.get('to', '') if inline_info else ''
+            try:
+                # Extract all comment information
+                comment_text = comment.get('content', {}).get('raw', '')
+                comment_html = comment.get('content', {}).get('html', '')
+                comment_markup = comment.get('content', {}).get('markup', '')
+                
+                # Extract author information
+                author_info = comment.get('user', {})
+                author_display_name = author_info.get('display_name', 'Unknown')
+                author_username = author_info.get('username', '')
+                author_uuid = author_info.get('uuid')
+                author_account_id = author_info.get('account_id', '')
+                
+                # Extract metadata
+                created_on = comment.get('created_on', '')
+                updated_on = comment.get('updated_on', '')
+                
+                # Extract parent comment info if this is a reply
+                parent_id = comment.get('parent', {}).get('id', '') if comment.get('parent') else ''
+                
+                # Extract inline info if this is an inline comment
+                inline_info = comment.get('inline', {})
+                inline_path = inline_info.get('path', '') if inline_info else ''
+                inline_from = inline_info.get('from', '') if inline_info else ''
+                inline_to = inline_info.get('to', '') if inline_info else ''
 
-            # Skip if comment is empty
-            if not comment_text.strip():
-                card_state['processed_pr_comments'].append(comment_id)
-                continue
+                # Skip if comment is empty
+                if not comment_text.strip():
+                    if 'processed_pr_comments' not in card_state:
+                        card_state['processed_pr_comments'] = []
+                    card_state['processed_pr_comments'].append(str(comment_id))
+                    continue
 
-            # Skip if comment is outdated
-            is_outdated = comment.get('outdated', False)
-            if is_outdated:
-                print(f"Skipping comment {comment_id} by {author_display_name} (outdated comment)")
-                card_state['processed_pr_comments'].append(comment_id)
-                continue
+                # Skip if comment has been deleted
+                is_deleted = comment.get('deleted', False)
+                if is_deleted:
+                    print(f"Skipping comment {comment_id} by {author_display_name} (deleted comment)")
+                    if 'processed_pr_comments' not in card_state:
+                        card_state['processed_pr_comments'] = []
+                    card_state['processed_pr_comments'].append(str(comment_id))
+                    continue
 
-            # Skip if comment has been deleted
-            is_deleted = comment.get('deleted', False)
-            if is_deleted:
-                print(f"Skipping comment {comment_id} by {author_display_name} (deleted comment)")
-                card_state['processed_pr_comments'].append(comment_id)
-                continue
+                # Skip if comment is from the bot itself - check for bot signature
+                is_bot_comment = self.bot_signature in comment_text
+                
+                if is_bot_comment:
+                    print(f"Skipping comment {comment_id} by {author_display_name} (bot comment detected)")
+                    if 'processed_pr_comments' not in card_state:
+                        card_state['processed_pr_comments'] = []
+                    card_state['processed_pr_comments'].append(str(comment_id))
+                    continue
 
-            # Skip if comment is from the bot itself
-            # Check multiple indicators:
-            # 1. Bot in display name
-            # 2. Starts with bot emoji
-            # 3. Contains specific auto-claude patterns
-            is_bot_comment = (
-                'bot' in author_display_name.lower() or 
-                comment_text.strip().startswith('🤖') or
-                'Automated Workflow Update:' in comment_text or
-                'Processed BitBucket PR comment:' in comment_text or
-                'Processed Trello comment update:' in comment_text or
-                'Claude Code Response' in comment_text
-            )
-            
-            if is_bot_comment:
-                print(f"Skipping comment {comment_id} by {author_display_name} (bot comment detected)")
-                card_state['processed_pr_comments'].append(comment_id)
-                continue
-
-            print(f"Executing PR comment from {author_display_name}: {comment_text[:50]}...")
-            
-            # Prepare full comment context
-            comment_context = f"""BitBucket PR Comment Details:
+                print(f"Processing PR comment ID: {comment_id} from {author_display_name}: {comment_text[:50]}...")
+                
+                # Prepare full comment context
+                comment_context = f"""BitBucket PR Comment Details:
 - Author: {author_display_name} (@{author_username})
 - Created: {created_on}
 - Updated: {updated_on}
@@ -672,20 +698,20 @@ Pull Request: {card_state.get('pr_url', 'Create PR manually from BitBucket')}
 Comment Text:
 {comment_text}
 """
-            
-            # Execute as Claude Code instruction with full context
-            claude_instruction = f"Analyse the changes made in this git branch. Use this knowledge to process the following feedback.\n{comment_context}"
-            claude_output = self.execute_claude_code(claude_instruction, worktree_path)
-            
-            # Commit and push
-            commit_output, _ = self.commit_and_push(
-                worktree_path,
-                f"Update from PR comment by {author_display_name}: {comment_text[:50]}...",
-                card_id
-            )
-            
-            # Add response to both PR and Trello
-            response_text = f"""🤖 Processed BitBucket PR comment:
+                
+                # Execute as Claude Code instruction with full context
+                claude_instruction = f"Analyse the changes made in this git branch. Use this knowledge to process the following feedback.\n{comment_context}"
+                claude_output = self.execute_claude_code(claude_instruction, worktree_path)
+                
+                # Commit and push
+                commit_output, _ = self.commit_and_push(
+                    worktree_path,
+                    f"Update from PR comment by {author_display_name}: {comment_text[:50]}...",
+                    card_id
+                )
+                
+                # Add response to both PR and Trello
+                response_text = f"""🤖 Processed BitBucket PR comment:
 
 **Author**: {author_display_name} (@{author_username})
 **Created**: {created_on}
@@ -702,19 +728,31 @@ Comment Text:
 ```
 {commit_output}
 ```
-"""
-            
-            # Add to PR
-            self.add_pr_comment(pr_id, response_text)
-            
-            # Add to Trello
-            self.add_comment_to_card(card_id, response_text)
-            
-            # Mark as processed
-            card_state['processed_pr_comments'].append(comment_id)
+
+{self.bot_signature}"""
+                
+                # Add to PR
+                self.add_pr_comment(pr_id, response_text)
+                
+                # Add to Trello
+                self.add_comment_to_card(card_id, response_text)
+                
+            except Exception as e:
+                print(f"Error processing comment {comment_id}: {e}")
+                import traceback
+                traceback.print_exc()
+            finally:
+                # Always mark as processed (ensure it's a string)
+                if 'processed_pr_comments' not in card_state:
+                    card_state['processed_pr_comments'] = []
+                if str(comment_id) not in card_state['processed_pr_comments']:
+                    card_state['processed_pr_comments'].append(str(comment_id))
         
-        # Save updated state
-        self.save_card_state(card_id, card_state)
+            # Save updated state
+            if self.debug:
+                print(f"[DEBUG] Saving card state with {len(card_state.get('processed_pr_comments', []))} processed PR comments")
+                print(f"[DEBUG] Processed PR comment IDs being saved: {sorted([str(id) for id in card_state.get('processed_pr_comments', [])])}")
+            self.save_card_state(card_id, card_state)
     
     def run(self):
         """Main workflow loop - check for new cards and comments from both Trello and BitBucket."""
@@ -749,6 +787,10 @@ Comment Text:
                     
                     # Process BitBucket PR comments (if PR exists)
                     if BITBUCKET_ACCESS_TOKEN:  # Only if BitBucket is configured
+                        # Reload state after processing Trello comments to get updated processed_comments
+                        card_state = self.load_card_state(card_id)
+                        if self.debug:
+                            print(f"[DEBUG] Before processing PR comments - card state has {len(card_state.get('processed_pr_comments', []))} processed PR comments")
                         self.process_pr_comments(card_id, card_state)
             
             print("Workflow check completed successfully")
