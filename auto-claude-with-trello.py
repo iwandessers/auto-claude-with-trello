@@ -519,8 +519,18 @@ Git Operations:
         for comment in new_comments:
             comment_text = comment['data']['text']
             
-            # Skip bot comments
-            if '🤖' in comment_text:
+            # Skip bot comments - check multiple indicators
+            is_bot_comment = (
+                '🤖' in comment_text or
+                'Automated Workflow Update:' in comment_text or
+                'Processed BitBucket PR comment:' in comment_text or
+                'Processed Trello comment update:' in comment_text or
+                'Claude Code Response' in comment_text or
+                'Claude Code Output:' in comment_text
+            )
+            
+            if is_bot_comment:
+                print(f"Skipping Trello comment (bot comment detected)")
                 card_state['processed_comments'].append(comment['id'])
                 continue
             
@@ -551,6 +561,7 @@ Pull Request: {card_state.get('pr_url', 'Create PR manually from BitBucket')}
         # Save updated state
         self.save_card_state(card_id, card_state)
     
+    
     def process_pr_comments(self, card_id: str, card_state: Dict):
         """Process new comments from BitBucket PR as Claude Code instructions."""
         branch_name = card_state['branch']
@@ -577,7 +588,7 @@ Pull Request: {card_state.get('pr_url', 'Create PR manually from BitBucket')}
         if not new_pr_comments:
             return
         
-        print(f"Processing {len(new_pr_comments)} new BitBucket PR comments for card: {card_id}")
+        print(f"Found {len(new_pr_comments)} new BitBucket PR comments for card: {card_id}")
         
         worktree_path = self.checkout_worktree(branch_name, card_id)
         
@@ -613,9 +624,22 @@ Pull Request: {card_state.get('pr_url', 'Create PR manually from BitBucket')}
                 card_state['processed_pr_comments'].append(comment_id)
                 continue
 
-            # Skip if comment is from the bot itself (based on display name)
-            if 'bot' in author_display_name.lower():
-                print(f"Skipping comment {comment_id} by {author_display_name} (bot detected)")
+            # Skip if comment is from the bot itself
+            # Check multiple indicators:
+            # 1. Bot in display name
+            # 2. Starts with bot emoji
+            # 3. Contains specific auto-claude patterns
+            is_bot_comment = (
+                'bot' in author_display_name.lower() or 
+                comment_text.strip().startswith('🤖') or
+                'Automated Workflow Update:' in comment_text or
+                'Processed BitBucket PR comment:' in comment_text or
+                'Processed Trello comment update:' in comment_text or
+                'Claude Code Response' in comment_text
+            )
+            
+            if is_bot_comment:
+                print(f"Skipping comment {comment_id} by {author_display_name} (bot comment detected)")
                 card_state['processed_pr_comments'].append(comment_id)
                 continue
 
