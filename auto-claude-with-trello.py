@@ -18,10 +18,10 @@ To create a BitBucket repository access token:
 1. Go to BitBucket → Personal settings → App passwords
 2. Or for repository-specific: Repository settings → Access tokens
 3. Create token with these permissions:
-   - repository:read (to fetch PRs and comments)
-   - repository:write (to create comments)
-   - pullrequest:read (to read PR details)
-   - pullrequest:write (to comment on PRs)
+   - repository:read (Grants ability to read repository content, PRs, comments. Essential for fetching information.)
+   - repository:write (Grants ability to push changes to the repository. Essential for committing Claude's output.)
+   - pullrequest:read (Grants ability to read pull request details and comments specifically. Often covered by 'repository:read' but good to ensure if available.)
+   - pullrequest:write (Grants ability to comment on pull requests, approve, merge, decline. Essential for adding feedback and managing PRs.)
 """
 
 import os
@@ -72,6 +72,9 @@ class ExtendedWorkflowAutomation:
             'Accept': 'application/json',
             'Content-Type': 'application/json'
         } if BITBUCKET_ACCESS_TOKEN else None
+        self.bot_user_uuid = None
+        if self.bb_headers: # Only attempt if headers are available
+            self.bot_user_uuid = self.get_current_user_uuid()
         
     def ensure_directories(self):
         """Create necessary directories if they don't exist."""
@@ -119,6 +122,43 @@ class ExtendedWorkflowAutomation:
             except Exception as e:
                 print(f"Error loading state file {state_file}: {e}")
         return states
+
+    def get_current_user_uuid(self) -> Optional[str]:
+        if not self.bb_headers:
+            print("BitBucket headers not configured, cannot fetch user UUID.")
+            return None
+        url = "https://api.bitbucket.org/2.0/user"
+        try:
+            response = requests.get(url, headers=self.bb_headers)
+            response.raise_for_status() # Check for HTTP errors
+            user_data = response.json()
+            uuid = user_data.get('uuid')
+            if self.debug:
+                print(f"[DEBUG] Fetched current user UUID: {uuid}")
+            return uuid
+        except requests.exceptions.RequestException as e:
+            error_message = f"Error fetching current user UUID: {e}"
+            if e.response is not None:
+                try:
+                    error_details = e.response.json()
+                    error_message += f" - Details: {error_details.get('error', {}).get('message', e.response.text)}"
+                except ValueError:
+                    error_message += f" - Status: {e.response.status_code}, Content: {e.response.text[:200]}"
+            print(error_message)
+        except Exception as e: # Catch any other unexpected errors
+            print(f"Unexpected error fetching current user UUID: {e}")
+        return None
+
+    # BitBucket API Rate Limiting:
+    # BitBucket Cloud has API rate limits. While this script's 60-second loop delay
+    # (if run with --loop) significantly reduces the risk of hitting these limits for
+    # typical usage, very high activity repositories or more frequent checks might
+    # approach these limits.
+    # The API typically returns a 429 HTTP status code when rate limits are exceeded.
+    # Currently, the script relies on the delay and general error handling.
+    # For more aggressive polling or extremely active repositories, implementing
+    # explicit handling for 429 responses with an exponential backoff and retry
+    # strategy would be a robust future enhancement for the BitBucket API calls.
     
     # === BitBucket PR Methods ===
     
@@ -139,8 +179,15 @@ class ExtendedWorkflowAutomation:
                 data = response.json()
                 if data['values']:
                     return data['values'][0]
-        except Exception as e:
-            print(f"Error fetching PR: {e}")
+        except requests.exceptions.RequestException as e:
+            error_message = f"Error fetching PR: {e}"
+            if e.response is not None:
+                try:
+                    error_details = e.response.json()
+                    error_message += f" - Details: {error_details.get('error', {}).get('message', e.response.text)}"
+                except ValueError: # Not a JSON response
+                    error_message += f" - Status: {e.response.status_code}, Content: {e.response.text[:200]}" # Log first 200 chars
+            print(error_message)
         
         return None
     
@@ -151,18 +198,41 @@ class ExtendedWorkflowAutomation:
             
         url = f"{self.bb_base_url}/pullrequests/{pr_id}/comments"
         comments = []
+        initial_request = True # Flag for the first request
         
         try:
             while url:
-                response = requests.get(url, headers=self.bb_headers)
+                if initial_request:
+                    params = {'pagelen': 50}
+                    response = requests.get(url, headers=self.bb_headers, params=params)
+                    initial_request = False # Unset flag after first request
+                else:
+                    # Subsequent requests use the 'next' URL which includes pagination parameters
+                    response = requests.get(url, headers=self.bb_headers)
+
                 if response.status_code == 200:
                     data = response.json()
                     comments.extend(data.get('values', []))
                     url = data.get('next')
                 else:
+                    # Log error for non-200 responses if needed, then break
+                    error_message = f"Error fetching PR comments: Status {response.status_code}"
+                    try:
+                        error_details = response.json()
+                        error_message += f" - Details: {error_details.get('error', {}).get('message', response.text)}"
+                    except ValueError:
+                        error_message += f" - Content: {response.text[:200]}"
+                    print(error_message)
                     break
-        except Exception as e:
-            print(f"Error fetching PR comments: {e}")
+        except requests.exceptions.RequestException as e:
+            error_message = f"Error fetching PR comments: {e}"
+            if e.response is not None:
+                try:
+                    error_details = e.response.json()
+                    error_message += f" - Details: {error_details.get('error', {}).get('message', e.response.text)}"
+                except ValueError: # Not a JSON response
+                    error_message += f" - Status: {e.response.status_code}, Content: {e.response.text[:200]}"
+            print(error_message)
                     
         return comments
     
@@ -180,10 +250,16 @@ class ExtendedWorkflowAutomation:
         
         try:
             response = requests.post(url, headers=self.bb_headers, json=data)
-            if response.status_code != 201:
-                print(f"Failed to add PR comment: {response.status_code}")
-        except Exception as e:
-            print(f"Error adding PR comment: {e}")
+            response.raise_for_status() # Will raise an HTTPError for bad responses (4xx or 5xx)
+        except requests.exceptions.RequestException as e:
+            error_message = f"Error adding PR comment: {e}"
+            if e.response is not None:
+                try:
+                    error_details = e.response.json()
+                    error_message += f" - Details: {error_details.get('error', {}).get('message', e.response.text)}"
+                except ValueError: # Not a JSON response
+                    error_message += f" - Status: {e.response.status_code}, Content: {e.response.text[:200]}"
+            print(error_message)
     
     # === Trello Methods ===
     
@@ -534,15 +610,29 @@ Pull Request: {card_state.get('pr_url', 'Create PR manually from BitBucket')}
         for comment in new_pr_comments:
             # Extract comment text
             comment_text = comment.get('content', {}).get('raw', '')
-            author = comment.get('user', {}).get('display_name', 'Unknown')
+            author_display_name = comment.get('user', {}).get('display_name', 'Unknown') # For logging
+            author_uuid = comment.get('user', {}).get('uuid')
             comment_id = str(comment['id'])
-            
-            # Skip if comment is empty or from bot
-            if not comment_text.strip() or 'bot' in author.lower() or '🤖' in comment_text:
+
+            # Skip if comment is empty
+            if not comment_text.strip():
+                card_state['processed_pr_comments'].append(comment_id)
+                continue
+
+            # Skip if comment is from the bot itself (based on UUID)
+            if self.bot_user_uuid and author_uuid == self.bot_user_uuid:
+                print(f"Skipping own comment {comment_id} by {author_display_name} (UUID match)")
                 card_state['processed_pr_comments'].append(comment_id)
                 continue
             
-            print(f"Executing PR comment from {author}: {comment_text[:50]}...")
+            # Fallback: if UUID was not fetched, and 'bot' is in the author's display name.
+            # This is less reliable but can be a secondary check.
+            if not self.bot_user_uuid and 'bot' in author_display_name.lower():
+                print(f"Skipping comment {comment_id} by {author_display_name} (name match as fallback)")
+                card_state['processed_pr_comments'].append(comment_id)
+                continue
+
+            print(f"Executing PR comment from {author_display_name}: {comment_text[:50]}...")
             
             # Execute as Claude Code instruction
             claude_output = self.execute_claude_code(comment_text, worktree_path)
