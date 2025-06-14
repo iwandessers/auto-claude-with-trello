@@ -72,9 +72,6 @@ class ExtendedWorkflowAutomation:
             'Accept': 'application/json',
             'Content-Type': 'application/json'
         } if BITBUCKET_ACCESS_TOKEN else None
-        self.bot_user_uuid = None
-        if self.bb_headers: # Only attempt if headers are available
-            self.bot_user_uuid = self.get_current_user_uuid()
         
     def ensure_directories(self):
         """Create necessary directories if they don't exist."""
@@ -123,31 +120,6 @@ class ExtendedWorkflowAutomation:
                 print(f"Error loading state file {state_file}: {e}")
         return states
 
-    def get_current_user_uuid(self) -> Optional[str]:
-        if not self.bb_headers:
-            print("BitBucket headers not configured, cannot fetch user UUID.")
-            return None
-        url = "https://api.bitbucket.org/2.0/user"
-        try:
-            response = requests.get(url, headers=self.bb_headers)
-            response.raise_for_status() # Check for HTTP errors
-            user_data = response.json()
-            uuid = user_data.get('uuid')
-            if self.debug:
-                print(f"[DEBUG] Fetched current user UUID: {uuid}")
-            return uuid
-        except requests.exceptions.RequestException as e:
-            error_message = f"Error fetching current user UUID: {e}"
-            if e.response is not None:
-                try:
-                    error_details = e.response.json()
-                    error_message += f" - Details: {error_details.get('error', {}).get('message', e.response.text)}"
-                except ValueError:
-                    error_message += f" - Status: {e.response.status_code}, Content: {e.response.text[:200]}"
-            print(error_message)
-        except Exception as e: # Catch any other unexpected errors
-            print(f"Unexpected error fetching current user UUID: {e}")
-        return None
 
     # BitBucket API Rate Limiting:
     # BitBucket Cloud has API rate limits. While this script's 60-second loop delay
@@ -482,7 +454,8 @@ class ExtendedWorkflowAutomation:
         card_state['card_name'] = card_name
         
         # Execute Claude Code with description
-        claude_output = self.execute_claude_code(description, worktree_path)
+        claude_instruction = f"Analyse the changes made in this git branch. Use this knowledge to process the following feedback.\n{description}"
+        claude_output = self.execute_claude_code(claude_instruction, worktree_path)
         
         # Commit and push
         commit_output, pr_url = self.commit_and_push(
@@ -551,7 +524,8 @@ Git Operations:
                 card_state['processed_comments'].append(comment['id'])
                 continue
             
-            claude_output = self.execute_claude_code(comment_text, worktree_path)
+            claude_instruction = f"Analyse the changes made in this git branch. Use this knowledge to process the following feedback.\n{comment_text}"
+            claude_output = self.execute_claude_code(claude_instruction, worktree_path)
             
             commit_output, _ = self.commit_and_push(
                 worktree_path,
@@ -608,51 +582,85 @@ Pull Request: {card_state.get('pr_url', 'Create PR manually from BitBucket')}
         worktree_path = self.checkout_worktree(branch_name, card_id)
         
         for comment in new_pr_comments:
-            # Extract comment text
+            # Extract all comment information
             comment_text = comment.get('content', {}).get('raw', '')
-            author_display_name = comment.get('user', {}).get('display_name', 'Unknown') # For logging
-            author_uuid = comment.get('user', {}).get('uuid')
+            comment_html = comment.get('content', {}).get('html', '')
+            comment_markup = comment.get('content', {}).get('markup', '')
+            
+            # Extract author information
+            author_info = comment.get('user', {})
+            author_display_name = author_info.get('display_name', 'Unknown')
+            author_username = author_info.get('username', '')
+            author_uuid = author_info.get('uuid')
+            author_account_id = author_info.get('account_id', '')
+            
+            # Extract metadata
             comment_id = str(comment['id'])
+            created_on = comment.get('created_on', '')
+            updated_on = comment.get('updated_on', '')
+            
+            # Extract parent comment info if this is a reply
+            parent_id = comment.get('parent', {}).get('id', '') if comment.get('parent') else ''
+            
+            # Extract inline info if this is an inline comment
+            inline_info = comment.get('inline', {})
+            inline_path = inline_info.get('path', '') if inline_info else ''
+            inline_from = inline_info.get('from', '') if inline_info else ''
+            inline_to = inline_info.get('to', '') if inline_info else ''
 
             # Skip if comment is empty
             if not comment_text.strip():
                 card_state['processed_pr_comments'].append(comment_id)
                 continue
 
-            # Skip if comment is from the bot itself (based on UUID)
-            if self.bot_user_uuid and author_uuid == self.bot_user_uuid:
-                print(f"Skipping own comment {comment_id} by {author_display_name} (UUID match)")
-                card_state['processed_pr_comments'].append(comment_id)
-                continue
-            
-            # Fallback: if UUID was not fetched, and 'bot' is in the author's display name.
-            # This is less reliable but can be a secondary check.
-            if not self.bot_user_uuid and 'bot' in author_display_name.lower():
-                print(f"Skipping comment {comment_id} by {author_display_name} (name match as fallback)")
+            # Skip if comment is from the bot itself (based on display name)
+            if 'bot' in author_display_name.lower():
+                print(f"Skipping comment {comment_id} by {author_display_name} (bot detected)")
                 card_state['processed_pr_comments'].append(comment_id)
                 continue
 
             print(f"Executing PR comment from {author_display_name}: {comment_text[:50]}...")
             
-            # Execute as Claude Code instruction
-            claude_output = self.execute_claude_code(comment_text, worktree_path)
+            # Prepare full comment context
+            comment_context = f"""BitBucket PR Comment Details:
+- Author: {author_display_name} (@{author_username})
+- Created: {created_on}
+- Updated: {updated_on}
+- Comment ID: {comment_id}
+{f'- Parent Comment ID: {parent_id}' if parent_id else ''}
+{f'- Inline comment on file: {inline_path}' if inline_path else ''}
+{f'- Line range: {inline_from} to {inline_to}' if inline_from else ''}
+
+Comment Text:
+{comment_text}
+"""
+            
+            # Execute as Claude Code instruction with full context
+            claude_instruction = f"Analyse the changes made in this git branch. Use this knowledge to process the following feedback.\n{comment_context}"
+            claude_output = self.execute_claude_code(claude_instruction, worktree_path)
             
             # Commit and push
             commit_output, _ = self.commit_and_push(
                 worktree_path,
-                f"Update from PR comment by {author}: {comment_text[:50]}...",
+                f"Update from PR comment by {author_display_name}: {comment_text[:50]}...",
                 card_id
             )
             
             # Add response to both PR and Trello
             response_text = f"""🤖 Processed BitBucket PR comment:
 
-**Author**: {author}
-**Comment**: {comment_text[:100]}...
+**Author**: {author_display_name} (@{author_username})
+**Created**: {created_on}
+**Comment ID**: {comment_id}
+{f'**Reply to**: Comment #{parent_id}' if parent_id else ''}
+{f'**File**: {inline_path} (lines {inline_from}-{inline_to})' if inline_path else ''}
 
+**Comment**: {comment_text[:200]}{'...' if len(comment_text) > 200 else ''}
+
+**Claude Code Response**:
 {claude_output}
 
-Git Operations:
+**Git Operations**:
 ```
 {commit_output}
 ```
