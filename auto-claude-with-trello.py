@@ -624,6 +624,20 @@ Pull Request: {card_state.get('pr_url', 'Create PR manually from BitBucket')}
                 card_state['processed_pr_comments'].append(comment_id)
                 continue
 
+            # Skip if comment is outdated
+            is_outdated = comment.get('outdated', False)
+            if is_outdated:
+                print(f"Skipping comment {comment_id} by {author_display_name} (outdated comment)")
+                card_state['processed_pr_comments'].append(comment_id)
+                continue
+
+            # Skip if comment has been deleted
+            is_deleted = comment.get('deleted', False)
+            if is_deleted:
+                print(f"Skipping comment {comment_id} by {author_display_name} (deleted comment)")
+                card_state['processed_pr_comments'].append(comment_id)
+                continue
+
             # Skip if comment is from the bot itself
             # Check multiple indicators:
             # 1. Bot in display name
