@@ -31,6 +31,7 @@ import subprocess
 import time
 import re
 import argparse
+import shutil
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 from pathlib import Path
@@ -60,6 +61,7 @@ if not GIT_REPO_PATH:
 WORKFLOW_STATE_DIR = os.getenv('WORKFLOW_STATE_DIR', os.path.expanduser('~/.trello-workflow'))
 WORKTREE_BASE_DIR = os.path.join(WORKFLOW_STATE_DIR, 'worktrees')
 CARDS_STATE_DIR = os.path.join(WORKFLOW_STATE_DIR, 'cards')
+ATTACHMENTS_BASE_DIR = os.path.join(WORKFLOW_STATE_DIR, 'attachments')
 
 
 class ExtendedWorkflowAutomation:
@@ -80,6 +82,7 @@ class ExtendedWorkflowAutomation:
         os.makedirs(WORKFLOW_STATE_DIR, exist_ok=True)
         os.makedirs(WORKTREE_BASE_DIR, exist_ok=True)
         os.makedirs(CARDS_STATE_DIR, exist_ok=True)
+        os.makedirs(ATTACHMENTS_BASE_DIR, exist_ok=True)
     
     def get_card_state_file(self, card_id: str) -> str:
         """Get the state file path for a specific card."""
@@ -292,6 +295,18 @@ class ExtendedWorkflowAutomation:
         response.raise_for_status()
         return response.json()
     
+    def get_card_attachments(self, card_id: str) -> List[Dict]:
+        """Get all attachments for a specific card."""
+        url = f"https://api.trello.com/1/cards/{card_id}/attachments"
+        params = {
+            'key': TRELLO_API_KEY,
+            'token': TRELLO_TOKEN
+        }
+        
+        response = requests.get(url, params=params)
+        response.raise_for_status()
+        return response.json()
+    
     def add_comment_to_card(self, card_id: str, comment: str):
         """Add a comment to a Trello card."""
         url = f"https://api.trello.com/1/cards/{card_id}/actions/comments"
@@ -303,6 +318,81 @@ class ExtendedWorkflowAutomation:
         
         response = requests.post(url, params=params)
         response.raise_for_status()
+    
+    # === Attachment Methods ===
+    
+    def download_attachment(self, attachment: Dict, card_id: str) -> str:
+        """Download attachment to workflow state directory and return local path."""
+        # Create card-specific attachments directory
+        attachments_dir = os.path.join(ATTACHMENTS_BASE_DIR, card_id)
+        os.makedirs(attachments_dir, exist_ok=True)
+        
+        filename = attachment['name']
+        local_path = os.path.join(attachments_dir, filename)
+        
+        # Skip download if file already exists
+        if os.path.exists(local_path):
+            if self.debug:
+                print(f"[DEBUG] Attachment already exists: {local_path}")
+            return local_path
+        
+        try:
+            # Download file
+            response = requests.get(attachment['url'])
+            response.raise_for_status()
+            
+            # Save to local file
+            with open(local_path, 'wb') as f:
+                f.write(response.content)
+            
+            if self.debug:
+                print(f"[DEBUG] Downloaded attachment: {filename} -> {local_path}")
+            
+            return local_path
+            
+        except requests.exceptions.RequestException as e:
+            print(f"Error downloading attachment '{filename}': {e}")
+            return None
+    
+    def process_attachments(self, card_id: str) -> str:
+        """Process all attachments for a card and return context string."""
+        attachments = self.get_card_attachments(card_id)
+        
+        if not attachments:
+            return ""
+        
+        attachment_context = "\n\nAttached files available for analysis:"
+        attachment_paths = []
+        
+        for attachment in attachments:
+            local_path = self.download_attachment(attachment, card_id)
+            if local_path:
+                attachment_paths.append(local_path)
+                attachment_context += f"\n- {attachment['name']} ({attachment.get('bytes', 'unknown size')} bytes)"
+                attachment_context += f"\n  File path: {local_path}"
+                attachment_context += f"\n  Type: {attachment.get('mimeType', 'unknown')}"
+                
+                # For text files, include content directly
+                if attachment.get('mimeType', '').startswith('text/') and attachment.get('bytes', 0) < 10000:
+                    try:
+                        with open(local_path, 'r', encoding='utf-8') as f:
+                            content = f.read()
+                        attachment_context += f"\n  Content:\n```\n{content}\n```"
+                    except Exception as e:
+                        attachment_context += f"\n  (Could not read content: {e})"
+        
+        return attachment_context
+    
+    def cleanup_attachments(self, card_id: str):
+        """Clean up downloaded attachments for a card."""
+        attachments_dir = os.path.join(ATTACHMENTS_BASE_DIR, card_id)
+        if os.path.exists(attachments_dir):
+            try:
+                shutil.rmtree(attachments_dir)
+                if self.debug:
+                    print(f"[DEBUG] Cleaned up attachments for card: {card_id}")
+            except Exception as e:
+                print(f"Error cleaning up attachments for card {card_id}: {e}")
     
     # === Git and Claude Code Methods ===
     
@@ -483,8 +573,11 @@ class ExtendedWorkflowAutomation:
         card_state['worktree_path'] = worktree_path
         card_state['card_name'] = card_name
         
-        # Execute Claude Code with description
-        claude_instruction = f"Analyse the changes made in this git branch. Use this knowledge to process the following feedback.\n{description}"
+        # Process attachments and include in instruction
+        attachment_context = self.process_attachments(card_id)
+        
+        # Execute Claude Code with description and attachments
+        claude_instruction = f"Analyse the changes made in this git branch. Use this knowledge to process the following feedback.\n{description}{attachment_context}"
         claude_output = self.execute_claude_code(claude_instruction, worktree_path)
         
         # Commit and push
@@ -557,7 +650,10 @@ Git Operations:
                 card_state['processed_comments'].append(comment['id'])
                 continue
             
-            claude_instruction = f"Analyse the changes made in this git branch. Use this knowledge to process the following feedback.\n{comment_text}"
+            # Process attachments for additional context
+            attachment_context = self.process_attachments(card_id)
+            
+            claude_instruction = f"Analyse the changes made in this git branch. Use this knowledge to process the following feedback.\n{comment_text}{attachment_context}"
             claude_output = self.execute_claude_code(claude_instruction, worktree_path)
             
             commit_output, _ = self.commit_and_push(
@@ -699,8 +795,11 @@ Comment Text:
 {comment_text}
 """
                 
+                # Process attachments for additional context
+                attachment_context = self.process_attachments(card_id)
+                
                 # Execute as Claude Code instruction with full context
-                claude_instruction = f"Analyse the changes made in this git branch. Use this knowledge to process the following feedback.\n{comment_context}"
+                claude_instruction = f"Analyse the changes made in this git branch. Use this knowledge to process the following feedback.\n{comment_context}{attachment_context}"
                 claude_output = self.execute_claude_code(claude_instruction, worktree_path)
                 
                 # Commit and push
@@ -830,6 +929,26 @@ def cleanup_worktrees():
             )
 
 
+def cleanup_old_attachments(days_old=7):
+    """Clean up attachment files older than specified days."""
+    if not os.path.exists(ATTACHMENTS_BASE_DIR):
+        return
+    
+    import time
+    cutoff_time = time.time() - (days_old * 24 * 60 * 60)
+    
+    for card_dir in os.listdir(ATTACHMENTS_BASE_DIR):
+        card_path = os.path.join(ATTACHMENTS_BASE_DIR, card_dir)
+        if os.path.isdir(card_path):
+            # Check if directory is old
+            if os.path.getmtime(card_path) < cutoff_time:
+                try:
+                    shutil.rmtree(card_path)
+                    print(f"Cleaned up old attachments for card: {card_dir}")
+                except Exception as e:
+                    print(f"Error cleaning up old attachments for {card_dir}: {e}")
+
+
 def main():
     """Run the workflow once or in a loop."""
     parser = argparse.ArgumentParser(description='Trello and BitBucket automation workflow')
@@ -838,8 +957,9 @@ def main():
     parser.add_argument('--debug', action='store_true', help='Enable debug output')
     args = parser.parse_args()
     
-    # Clean up any orphaned worktrees on startup
+    # Clean up any orphaned worktrees and old attachments on startup
     cleanup_worktrees()
+    cleanup_old_attachments()
     
     automation = ExtendedWorkflowAutomation(debug=args.debug)
     
