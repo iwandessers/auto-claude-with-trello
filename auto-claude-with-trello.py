@@ -300,7 +300,8 @@ class ExtendedWorkflowAutomation:
         url = f"https://api.trello.com/1/cards/{card_id}/attachments"
         params = {
             'key': TRELLO_API_KEY,
-            'token': TRELLO_TOKEN
+            'token': TRELLO_TOKEN,
+            'fields': 'id,name,url,mimeType,bytes'  # Explicitly request the url field
         }
         
         response = requests.get(url, params=params)
@@ -337,8 +338,28 @@ class ExtendedWorkflowAutomation:
             return local_path
         
         try:
-            # Download file
-            response = requests.get(attachment['url'])
+            # Debug: print what we're getting
+            if self.debug:
+                print(f"[DEBUG] Attachment object: {attachment}")
+                print(f"[DEBUG] Attempting to download from URL: {attachment.get('url', 'NO URL FIELD')}")
+            
+            # The attachment URL needs OAuth authentication via Authorization header
+            download_url = attachment.get('url')
+            if not download_url:
+                print(f"Error: No 'url' field in attachment object for '{filename}'")
+                return None
+            
+            # Trello attachment downloads require OAuth Authorization header, NOT query parameters
+            # Format: Authorization: OAuth oauth_consumer_key="KEY", oauth_token="TOKEN"
+            headers = {
+                'Authorization': f'OAuth oauth_consumer_key="{TRELLO_API_KEY}", oauth_token="{TRELLO_TOKEN}"'
+            }
+            
+            if self.debug:
+                print(f"[DEBUG] Download URL: {download_url}")
+                print(f"[DEBUG] Using OAuth Authorization header")
+            
+            response = requests.get(download_url, headers=headers)
             response.raise_for_status()
             
             # Save to local file
@@ -352,6 +373,12 @@ class ExtendedWorkflowAutomation:
             
         except requests.exceptions.RequestException as e:
             print(f"Error downloading attachment '{filename}': {e}")
+            if self.debug:
+                print(f"[DEBUG] Full attachment object: {attachment}")
+                if hasattr(e, 'response') and e.response is not None:
+                    print(f"[DEBUG] Response status: {e.response.status_code}")
+                    print(f"[DEBUG] Response headers: {e.response.headers}")
+                    print(f"[DEBUG] Response content: {e.response.text[:500]}...")
             return None
     
     def process_attachments(self, card_id: str) -> str:
@@ -859,12 +886,62 @@ Comment Text:
         print(f"Git repo: {GIT_REPO_PATH}")
         print(f"State directory: {WORKFLOW_STATE_DIR}")
         
+        # Ensure the main repo has the latest changes before processing tickets
+        print("Updating main repository with latest changes...")
+        try:
+            # First fetch all changes from origin
+            fetch_result = subprocess.run(
+                ['git', 'fetch', 'origin'],
+                cwd=GIT_REPO_PATH,
+                capture_output=True,
+                text=True
+            )
+            if fetch_result.returncode != 0:
+                print(f"Warning: Git fetch failed: {fetch_result.stderr}")
+            
+            # Get current branch
+            current_branch_result = subprocess.run(
+                ['git', 'branch', '--show-current'],
+                cwd=GIT_REPO_PATH,
+                capture_output=True,
+                text=True
+            )
+            current_branch = current_branch_result.stdout.strip()
+            
+            # Pull latest changes for current branch
+            if current_branch:
+                pull_result = subprocess.run(
+                    ['git', 'pull', 'origin', current_branch],
+                    cwd=GIT_REPO_PATH,
+                    capture_output=True,
+                    text=True
+                )
+                if pull_result.returncode != 0:
+                    print(f"Warning: Git pull failed: {pull_result.stderr}")
+                else:
+                    print(f"Successfully updated branch '{current_branch}'")
+            
+            # Also fetch all remote branches to ensure we have latest branch information
+            fetch_all_result = subprocess.run(
+                ['git', 'fetch', '--all'],
+                cwd=GIT_REPO_PATH,
+                capture_output=True,
+                text=True
+            )
+            if fetch_all_result.returncode == 0:
+                print("Successfully fetched all remote branches")
+                
+        except Exception as e:
+            print(f"Warning: Could not update repository: {e}")
+            # Continue processing even if update fails
+        
         try:
             # Load all existing card states
             all_card_states = self.get_all_card_states()
             
             # Get current cards from Trello
             cards = self.get_trello_cards()
+            print(f"Found {len(cards)} cards in Trello list")
             
             for card in cards:
                 card_id = card['id']
