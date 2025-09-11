@@ -31,7 +31,10 @@ import subprocess
 import time
 import re
 import argparse
+<<<<<<< HEAD
 import shutil
+=======
+>>>>>>> f614fea (Added bitbucket actions debug statements)
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 from pathlib import Path
@@ -76,6 +79,13 @@ class ExtendedWorkflowAutomation:
         } if BITBUCKET_ACCESS_TOKEN else None
         # Unique identifier for bot-generated comments
         self.bot_signature = "[auto-claude-bot:processed]"
+        
+        if self.debug:
+            print("[DEBUG] BitBucket Configuration:")
+            print(f"  - Workspace: {BITBUCKET_WORKSPACE}")
+            print(f"  - Repository: {BITBUCKET_REPO_SLUG}")
+            print(f"  - API Base URL: {self.bb_base_url}")
+            print(f"  - Access Token: {'Configured' if BITBUCKET_ACCESS_TOKEN else 'Not configured'}")
         
     def ensure_directories(self):
         """Create necessary directories if they don't exist."""
@@ -155,6 +165,8 @@ class ExtendedWorkflowAutomation:
     def get_pr_by_branch(self, branch_name: str) -> Optional[Dict]:
         """Find a PR by its source branch name."""
         if not self.bb_headers:
+            if self.debug:
+                print(f"[DEBUG] Skipping PR lookup - no BitBucket headers configured")
             return None
             
         url = f"{self.bb_base_url}/pullrequests"
@@ -163,11 +175,23 @@ class ExtendedWorkflowAutomation:
             'state': 'OPEN'
         }
         
+        if self.debug:
+            print(f"\n[DEBUG] get_pr_by_branch - Looking for PR with branch: {branch_name}")
+            print(f"[DEBUG] API URL: {url}")
+            print(f"[DEBUG] Query params: {params}")
+        
         try:
             response = requests.get(url, headers=self.bb_headers, params=params)
+            if self.debug:
+                print(f"[DEBUG] Response status: {response.status_code}")
+                
             if response.status_code == 200:
                 data = response.json()
+                if self.debug:
+                    print(f"[DEBUG] Found {len(data.get('values', []))} PRs")
+                    
                 if data['values']:
+<<<<<<< HEAD
                     return data['values'][0]
         except requests.exceptions.RequestException as e:
             error_message = f"Error fetching PR: {e}"
@@ -178,19 +202,47 @@ class ExtendedWorkflowAutomation:
                 except ValueError: # Not a JSON response
                     error_message += f" - Status: {e.response.status_code}, Content: {e.response.text[:200]}" # Log first 200 chars
             print(error_message)
+=======
+                    pr = data['values'][0]
+                    if self.debug:
+                        print(f"[DEBUG] PR found: ID={pr['id']}, Title='{pr.get('title', 'N/A')}'")
+                        print(f"[DEBUG] PR State: {pr.get('state', 'N/A')}")
+                        print(f"[DEBUG] PR Links: {pr.get('links', {}).get('html', {}).get('href', 'N/A')}")
+                    return pr
+                else:
+                    if self.debug:
+                        print(f"[DEBUG] No PR found for branch: {branch_name}")
+            else:
+                if self.debug:
+                    print(f"[DEBUG] Failed to fetch PRs. Response: {response.text[:200]}...")
+        except Exception as e:
+            print(f"Error fetching PR: {e}")
+            if self.debug:
+                import traceback
+                print(f"[DEBUG] Full error traceback:")
+                traceback.print_exc()
+>>>>>>> f614fea (Added bitbucket actions debug statements)
         
         return None
     
     def get_pr_comments(self, pr_id: int) -> List[Dict]:
         """Fetch all comments from a BitBucket PR and filter for unresolved inline comments."""
         if not self.bb_headers:
+            if self.debug:
+                print(f"[DEBUG] Skipping PR comments fetch - no BitBucket headers configured")
             return []
             
         url = f"{self.bb_base_url}/pullrequests/{pr_id}/comments"
         all_comments = []
         
+        if self.debug:
+            print(f"\n[DEBUG] get_pr_comments - Fetching comments for PR ID: {pr_id}")
+            print(f"[DEBUG] Initial URL: {url}")
+        
         try:
+            page_count = 0
             while url:
+<<<<<<< HEAD
                 params = {'pagelen': 50} if 'pagelen' not in url else None
                 response = requests.get(url, headers=self.bb_headers, params=params)
 
@@ -238,12 +290,50 @@ class ExtendedWorkflowAutomation:
             # 2. OR it's a general comment (not inline) that's not resolved
             if (has_inline and not is_outdated and not is_resolved) or (not has_inline and not is_resolved):
                 filtered_comments.append(comment)
+=======
+                page_count += 1
+                if self.debug:
+                    print(f"[DEBUG] Fetching page {page_count}...")
+                    
+                response = requests.get(url, headers=self.bb_headers)
+                if self.debug:
+                    print(f"[DEBUG] Response status: {response.status_code}")
+                    
+                if response.status_code == 200:
+                    data = response.json()
+                    page_comments = data.get('values', [])
+                    comments.extend(page_comments)
+                    
+                    if self.debug:
+                        print(f"[DEBUG] Page {page_count}: Found {len(page_comments)} comments")
+                        for idx, comment in enumerate(page_comments):
+                            author = comment.get('user', {}).get('display_name', 'Unknown')
+                            content = comment.get('content', {}).get('raw', '')[:50]
+                            print(f"[DEBUG]   Comment {idx+1}: ID={comment['id']}, Author={author}, Content='{content}...'")
+                    
+                    url = data.get('next')
+                else:
+                    if self.debug:
+                        print(f"[DEBUG] Failed to fetch comments. Response: {response.text[:200]}...")
+                    break
+        except Exception as e:
+            print(f"Error fetching PR comments: {e}")
+            if self.debug:
+                import traceback
+                print(f"[DEBUG] Full error traceback:")
+                traceback.print_exc()
+        
+        if self.debug:
+            print(f"[DEBUG] Total comments fetched: {len(comments)}")
+>>>>>>> f614fea (Added bitbucket actions debug statements)
                     
         return filtered_comments
     
     def add_pr_comment(self, pr_id: int, comment: str):
         """Add a comment to a BitBucket PR."""
         if not self.bb_headers:
+            if self.debug:
+                print(f"[DEBUG] Skipping PR comment add - no BitBucket headers configured")
             return
             
         url = f"{self.bb_base_url}/pullrequests/{pr_id}/comments"
@@ -253,8 +343,15 @@ class ExtendedWorkflowAutomation:
             }
         }
         
+        if self.debug:
+            print(f"\n[DEBUG] add_pr_comment - Adding comment to PR ID: {pr_id}")
+            print(f"[DEBUG] API URL: {url}")
+            print(f"[DEBUG] Comment length: {len(comment)} characters")
+            print(f"[DEBUG] Comment preview: {comment[:100]}...")
+        
         try:
             response = requests.post(url, headers=self.bb_headers, json=data)
+<<<<<<< HEAD
             response.raise_for_status() # Will raise an HTTPError for bad responses (4xx or 5xx)
         except requests.exceptions.RequestException as e:
             error_message = f"Error adding PR comment: {e}"
@@ -265,6 +362,25 @@ class ExtendedWorkflowAutomation:
                 except ValueError: # Not a JSON response
                     error_message += f" - Status: {e.response.status_code}, Content: {e.response.text[:200]}"
             print(error_message)
+=======
+            if self.debug:
+                print(f"[DEBUG] Response status: {response.status_code}")
+                
+            if response.status_code == 201:
+                if self.debug:
+                    resp_data = response.json()
+                    print(f"[DEBUG] Comment added successfully! Comment ID: {resp_data.get('id', 'N/A')}")
+            else:
+                print(f"Failed to add PR comment: {response.status_code}")
+                if self.debug:
+                    print(f"[DEBUG] Response body: {response.text[:500]}...")
+        except Exception as e:
+            print(f"Error adding PR comment: {e}")
+            if self.debug:
+                import traceback
+                print(f"[DEBUG] Full error traceback:")
+                traceback.print_exc()
+>>>>>>> f614fea (Added bitbucket actions debug statements)
     
     # === Trello Methods ===
     
@@ -502,7 +618,11 @@ class ExtendedWorkflowAutomation:
         # Debug logging
         if self.debug:
             print(f"\n[DEBUG] Executing Claude Code with instruction length: {len(instructions)} characters")
+<<<<<<< HEAD
             print(f"[DEBUG] First 500 chars of instruction: {instructions[:500]}...")
+=======
+            print(f"[DEBUG] First 200 chars of instruction: {instructions[:200]}...")
+>>>>>>> f614fea (Added bitbucket actions debug statements)
             if len(instructions) > 10000:
                 print(f"[WARNING] Very long instruction detected: {len(instructions)} characters!")
         
@@ -713,17 +833,29 @@ Pull Request: {card_state.get('pr_url', 'Create PR manually from BitBucket')}
         """Process new comments from BitBucket PR as Claude Code instructions."""
         branch_name = card_state['branch']
         
+        if self.debug:
+            print(f"\n[DEBUG] process_pr_comments - Starting for card: {card_id}")
+            print(f"[DEBUG] Branch name: {branch_name}")
+            print(f"[DEBUG] Current PR ID in state: {card_state.get('pr_id', 'Not set')}")
+        
         # Find PR for this branch
         pr_data = self.get_pr_by_branch(branch_name)
         if not pr_data:
+            if self.debug:
+                print(f"[DEBUG] No PR found for branch {branch_name}, skipping PR comment processing")
             return
         
         pr_id = pr_data['id']
+        
+        if self.debug:
+            print(f"[DEBUG] Found PR ID: {pr_id}")
         
         # Update PR ID in state if not set
         if not card_state.get('pr_id'):
             card_state['pr_id'] = pr_id
             self.save_card_state(card_id, card_state)
+            if self.debug:
+                print(f"[DEBUG] Updated card state with PR ID: {pr_id}")
         
         # Get all PR comments
         pr_comments = self.get_pr_comments(pr_id)
@@ -734,6 +866,7 @@ Pull Request: {card_state.get('pr_url', 'Create PR manually from BitBucket')}
         new_pr_comments = [c for c in pr_comments if str(c['id']) not in processed_pr_ids]
         
         if self.debug:
+<<<<<<< HEAD
             print(f"[DEBUG] Card ID: {card_id}")
             print(f"[DEBUG] Card state loaded with {len(card_state.get('processed_pr_comments', []))} processed PR comment IDs")
             print(f"[DEBUG] PR Comments - Total: {len(pr_comments)}, Already processed: {len(processed_pr_ids)}, New: {len(new_pr_comments)}")
@@ -742,8 +875,17 @@ Pull Request: {card_state.get('pr_url', 'Create PR manually from BitBucket')}
                 print(f"[DEBUG] Current PR comment IDs: {sorted([str(c['id']) for c in pr_comments])}")
             if new_pr_comments:
                 print(f"[DEBUG] New PR comment IDs to process: {sorted([str(c['id']) for c in new_pr_comments])}")
+=======
+            print(f"[DEBUG] Total PR comments: {len(pr_comments)}")
+            print(f"[DEBUG] Already processed: {len(processed_pr_ids)}")
+            print(f"[DEBUG] New comments to process: {len(new_pr_comments)}")
+            if processed_pr_ids:
+                print(f"[DEBUG] Processed comment IDs: {list(processed_pr_ids)[:5]}{'...' if len(processed_pr_ids) > 5 else ''}")
+>>>>>>> f614fea (Added bitbucket actions debug statements)
         
         if not new_pr_comments:
+            if self.debug:
+                print(f"[DEBUG] No new PR comments to process")
             return
         
         print(f"Found {len(new_pr_comments)} new BitBucket PR comments for card: {card_id}")
@@ -754,6 +896,7 @@ Pull Request: {card_state.get('pr_url', 'Create PR manually from BitBucket')}
             # Extract metadata first to always have comment_id
             comment_id = str(comment['id'])
             
+<<<<<<< HEAD
             try:
                 # Extract all comment information
                 comment_text = comment.get('content', {}).get('raw', '')
@@ -779,6 +922,36 @@ Pull Request: {card_state.get('pr_url', 'Create PR manually from BitBucket')}
                 inline_path = inline_info.get('path', '') if inline_info else ''
                 inline_from = inline_info.get('from', '') if inline_info else ''
                 inline_to = inline_info.get('to', '') if inline_info else ''
+=======
+            if self.debug:
+                print(f"\n[DEBUG] Processing comment ID: {comment_id}")
+                print(f"[DEBUG] Author: {author}")
+                print(f"[DEBUG] Comment text length: {len(comment_text)} characters")
+                print(f"[DEBUG] Comment preview: {comment_text[:100]}...")
+            
+            # Skip if comment is empty or from bot
+            if not comment_text.strip() or 'bot' in author.lower() or '🤖' in comment_text:
+                if self.debug:
+                    skip_reason = "empty" if not comment_text.strip() else ("bot author" if 'bot' in author.lower() else "contains bot emoji")
+                    print(f"[DEBUG] Skipping comment (reason: {skip_reason})")
+                card_state['processed_pr_comments'].append(comment_id)
+                continue
+            
+            print(f"Executing PR comment from {author}: {comment_text[:50]}...")
+            
+            # Execute as Claude Code instruction
+            claude_output = self.execute_claude_code(comment_text, worktree_path)
+            
+            # Commit and push
+            commit_output, _ = self.commit_and_push(
+                worktree_path,
+                f"Update from PR comment by {author}: {comment_text[:50]}...",
+                card_id
+            )
+            
+            # Add response to both PR and Trello
+            response_text = f"""🤖 Processed BitBucket PR comment:
+>>>>>>> f614fea (Added bitbucket actions debug statements)
 
                 # Skip if comment is empty
                 if not comment_text.strip():
@@ -963,11 +1136,18 @@ Comment Text:
                     
                     # Process BitBucket PR comments (if PR exists)
                     if BITBUCKET_ACCESS_TOKEN:  # Only if BitBucket is configured
+<<<<<<< HEAD
                         # Reload state after processing Trello comments to get updated processed_comments
                         card_state = self.load_card_state(card_id)
                         if self.debug:
                             print(f"[DEBUG] Before processing PR comments - card state has {len(card_state.get('processed_pr_comments', []))} processed PR comments")
+=======
+                        if self.debug:
+                            print(f"\n[DEBUG] Checking for BitBucket PR comments for card: {card_id}")
+>>>>>>> f614fea (Added bitbucket actions debug statements)
                         self.process_pr_comments(card_id, card_state)
+                    elif self.debug:
+                        print(f"\n[DEBUG] Skipping BitBucket PR comment check - no access token configured")
             
             print("Workflow check completed successfully")
             
