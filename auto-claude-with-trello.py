@@ -653,9 +653,15 @@ class ExtendedWorkflowAutomation:
         
         # Extract PR URL from initial push if not found in commit push
         if not pr_url and push_output:
+            # Check for Bitbucket PR URL
             pr_match = re.search(r'https://bitbucket\.org/[^\s]+/pull-requests/new[^\s]*', push_output)
             if pr_match:
                 pr_url = pr_match.group(0)
+            else:
+                # Check for GitHub PR URL
+                pr_match = re.search(r'https://github\.com/[^\s]+/pull/new/[^\s]*', push_output)
+                if pr_match:
+                    pr_url = pr_match.group(0)
         
         # Update state with PR info
         if pr_url:
