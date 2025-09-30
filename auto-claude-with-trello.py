@@ -597,7 +597,7 @@ class ExtendedWorkflowAutomation:
         output.append(f"Git commit: {result.stdout}")
         
         result = subprocess.run(
-            ['git', 'push'],
+            ['git', 'push', '--set-upstream', 'origin'],
             cwd=worktree_path,
             capture_output=True,
             text=True
