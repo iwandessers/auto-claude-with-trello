@@ -315,7 +315,7 @@ class ExtendedWorkflowAutomation:
             # Removed 'actions' and 'actions_limit' - we fetch comments separately
         }
         
-        response = requests.get(url, params=params)
+        response = requests.get(url, params=params, timeout=30)
         response.raise_for_status()
         return response.json()
     
@@ -328,7 +328,7 @@ class ExtendedWorkflowAutomation:
             'filter': 'commentCard'
         }
         
-        response = requests.get(url, params=params)
+        response = requests.get(url, params=params, timeout=30)
         response.raise_for_status()
         return response.json()
     
