@@ -991,9 +991,13 @@ Comment Text:
             
             for card in cards:
                 card_id = card['id']
-                
+
                 if card_id not in all_card_states:
-                    # New card found
+                    # New card found - skip if description is empty
+                    description = card.get('desc', '').strip()
+                    if not description:
+                        print(f"Skipping card '{card['name']}' ({card_id}) - description is empty")
+                        continue
                     self.process_new_card(card)
                 else:
                     # Existing card - check for new comments from both sources
