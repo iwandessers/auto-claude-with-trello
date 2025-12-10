@@ -711,10 +711,17 @@ Git Operations:
         
         for comment in new_comments:
             comment_text = comment['data']['text']
-            
+
+            # Skip comments with user mentions/tags
+            has_mentions = bool(re.search(r'@\w+', comment_text))
+            if has_mentions:
+                print(f"Skipping Trello comment (contains user mentions)")
+                card_state['processed_comments'].append(comment['id'])
+                continue
+
             # Skip bot comments - check for bot signature
             is_bot_comment = self.bot_signature in comment_text
-            
+
             if is_bot_comment:
                 print(f"Skipping Trello comment (bot comment detected)")
                 card_state['processed_comments'].append(comment['id'])
