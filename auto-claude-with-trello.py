@@ -32,6 +32,7 @@ import time
 import re
 import argparse
 import shutil
+import uuid
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 from pathlib import Path
@@ -113,6 +114,7 @@ class ExtendedWorkflowAutomation:
             'branch': None,
             'pr_url': None,
             'pr_id': None,
+            'session_id': None,  # Claude Code session ID for conversation continuity
             'last_update': None,
             'processed_comments': [],
             'processed_pr_comments': [],  # List of string IDs of processed PR comments
@@ -460,14 +462,20 @@ class ExtendedWorkflowAutomation:
     
     # === Git and Claude Code Methods ===
     
-    def create_branch_name(self, card_name: str, card_id: str) -> str:
-        """Create a valid git branch name from card title and ID."""
+    def create_branch_name(self, card_name: str, session_id: str) -> str:
+        """Create a valid git branch name from card title and session ID.
+
+        Args:
+            card_name: The Trello card name
+            session_id: The Claude Code session UUID for guaranteed uniqueness
+        """
         # Clean the card name
         branch = re.sub(r'[^a-zA-Z0-9\s-]', '', card_name)
         branch = branch.replace(' ', '-').lower()
         branch = re.sub(r'-+', '-', branch)
-        # Include last 6 chars of card ID for uniqueness
-        return f"feature/{branch}-{card_id[-6:]}"[:50]
+        # Use first 8 chars of session ID for uniqueness (short UUID format)
+        session_short = session_id[:8]
+        return f"feature/{branch}-{session_short}"[:50]
     
     def create_worktree(self, branch_name: str, card_id: str) -> Tuple[str, str]:
         """Create a new git worktree for the branch."""
@@ -534,26 +542,39 @@ class ExtendedWorkflowAutomation:
         
         return worktree_path
     
-    def execute_claude_code(self, instructions: str, worktree_path: str) -> str:
-        """Execute instructions using Claude Code in the specified directory."""
+    def execute_claude_code(self, instructions: str, worktree_path: str, session_id: Optional[str] = None) -> str:
+        """Execute instructions using Claude Code in the specified directory.
+
+        Args:
+            instructions: The instruction to execute
+            worktree_path: Path to the git worktree
+            session_id: Optional session ID for conversation continuity
+        """
         # Debug logging
         if self.debug:
             print(f"\n[DEBUG] Executing Claude Code with instruction length: {len(instructions)} characters")
             print(f"[DEBUG] First 200 chars of instruction: {instructions[:200]}...")
+            print(f"[DEBUG] Session ID: {session_id if session_id else 'None (new session)'}")
             if len(instructions) > 10000:
                 print(f"[WARNING] Very long instruction detected: {len(instructions)} characters!")
-        
+
         # Escape quotes in instructions for shell command
         escaped_instructions = instructions.replace('"', '\\"')
-        
+
+        # Build command with optional session ID
+        cmd = ['claude', '--dangerously-skip-permissions']
+        if session_id:
+            cmd.extend(['--session-id', session_id])
+        cmd.extend(['-p', escaped_instructions])
+
         result = subprocess.run(
-            ['claude', '--dangerously-skip-permissions', '-p', escaped_instructions],
+            cmd,
             cwd=worktree_path,
             capture_output=True,
             text=True,
             timeout=1800  # 30 minutes timeout
         )
-        
+
         output = f"Claude Code Output:\n{result.stdout}"
         if result.stderr.strip():
             output += f"\n\nErrors (if any):\n{result.stderr}"
@@ -627,11 +648,17 @@ class ExtendedWorkflowAutomation:
         
         # Load or create card state
         card_state = self.load_card_state(card_id)
-        
-        # Create branch
-        branch_name = self.create_branch_name(card_name, card_id)
+
+        # Generate session ID for Claude Code conversation continuity
+        if not card_state.get('session_id'):
+            card_state['session_id'] = str(uuid.uuid4())
+            if self.debug:
+                print(f"[DEBUG] Generated new session ID: {card_state['session_id']}")
+
+        # Create branch using session ID for guaranteed uniqueness
+        branch_name = self.create_branch_name(card_name, card_state['session_id'])
         worktree_path, push_output = self.create_worktree(branch_name, card_id)
-        
+
         # Update state with branch info
         card_state['branch'] = branch_name
         card_state['worktree_path'] = worktree_path
@@ -639,10 +666,10 @@ class ExtendedWorkflowAutomation:
         
         # Process attachments and include in instruction
         attachment_context = self.process_attachments(card_id)
-        
+
         # Execute Claude Code with description and attachments
-        claude_instruction = f"Analyse the changes made in this git branch. Use this knowledge to process the following feedback.\n{description}{attachment_context}"
-        claude_output = self.execute_claude_code(claude_instruction, worktree_path)
+        claude_instruction = f"{description}{attachment_context}"
+        claude_output = self.execute_claude_code(claude_instruction, worktree_path, card_state.get('session_id'))
         
         # Commit and push
         commit_output, pr_url = self.commit_and_push(
@@ -729,9 +756,9 @@ Git Operations:
             
             # Process attachments for additional context
             attachment_context = self.process_attachments(card_id)
-            
+
             claude_instruction = f"Analyse the changes made in this git branch. Use this knowledge to process the following feedback.\n{comment_text}{attachment_context}"
-            claude_output = self.execute_claude_code(claude_instruction, worktree_path)
+            claude_output = self.execute_claude_code(claude_instruction, worktree_path, card_state.get('session_id'))
             
             commit_output, _ = self.commit_and_push(
                 worktree_path,
@@ -877,10 +904,10 @@ Comment Text:
                 
                 # Process attachments for additional context
                 attachment_context = self.process_attachments(card_id)
-                
+
                 # Execute as Claude Code instruction with full context
                 claude_instruction = f"Analyse the changes made in this git branch. Use this knowledge to process the following feedback.\n{comment_context}{attachment_context}"
-                claude_output = self.execute_claude_code(claude_instruction, worktree_path)
+                claude_output = self.execute_claude_code(claude_instruction, worktree_path, card_state.get('session_id'))
                 
                 # Commit and push
                 commit_output, _ = self.commit_and_push(
