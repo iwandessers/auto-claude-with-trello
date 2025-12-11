@@ -542,29 +542,36 @@ class ExtendedWorkflowAutomation:
         
         return worktree_path
     
-    def execute_claude_code(self, instructions: str, worktree_path: str, session_id: Optional[str] = None) -> str:
+    def execute_claude_code(self, instructions: str, worktree_path: str, session_id: Optional[str] = None, is_first_interaction: bool = True) -> str:
         """Execute instructions using Claude Code in the specified directory.
 
         Args:
             instructions: The instruction to execute
             worktree_path: Path to the git worktree
             session_id: Optional session ID for conversation continuity
+            is_first_interaction: True for first interaction (creates session), False for continuing
         """
         # Debug logging
         if self.debug:
             print(f"\n[DEBUG] Executing Claude Code with instruction length: {len(instructions)} characters")
             print(f"[DEBUG] First 200 chars of instruction: {instructions[:200]}...")
             print(f"[DEBUG] Session ID: {session_id if session_id else 'None (new session)'}")
+            print(f"[DEBUG] Is first interaction: {is_first_interaction}")
             if len(instructions) > 10000:
                 print(f"[WARNING] Very long instruction detected: {len(instructions)} characters!")
 
         # Escape quotes in instructions for shell command
         escaped_instructions = instructions.replace('"', '\\"')
 
-        # Build command with optional session ID
+        # Build command with session handling
         cmd = ['claude', '--dangerously-skip-permissions']
         if session_id:
-            cmd.extend(['--session-id', session_id])
+            if is_first_interaction:
+                # First interaction: create new session with specific ID
+                cmd.extend(['--session-id', session_id])
+            else:
+                # Subsequent interactions: resume existing session
+                cmd.extend(['--resume', session_id])
         cmd.extend(['-p', escaped_instructions])
 
         result = subprocess.run(
@@ -667,9 +674,14 @@ class ExtendedWorkflowAutomation:
         # Process attachments and include in instruction
         attachment_context = self.process_attachments(card_id)
 
-        # Execute Claude Code with description and attachments
+        # Execute Claude Code with description and attachments (first interaction)
         claude_instruction = f"{description}{attachment_context}"
-        claude_output = self.execute_claude_code(claude_instruction, worktree_path, card_state.get('session_id'))
+        claude_output = self.execute_claude_code(
+            claude_instruction,
+            worktree_path,
+            card_state.get('session_id'),
+            is_first_interaction=True
+        )
         
         # Commit and push
         commit_output, pr_url = self.commit_and_push(
@@ -757,8 +769,14 @@ Git Operations:
             # Process attachments for additional context
             attachment_context = self.process_attachments(card_id)
 
+            # Continue existing session for comment processing
             claude_instruction = f"Analyse the changes made in this git branch. Use this knowledge to process the following feedback.\n{comment_text}{attachment_context}"
-            claude_output = self.execute_claude_code(claude_instruction, worktree_path, card_state.get('session_id'))
+            claude_output = self.execute_claude_code(
+                claude_instruction,
+                worktree_path,
+                card_state.get('session_id'),
+                is_first_interaction=False
+            )
             
             commit_output, _ = self.commit_and_push(
                 worktree_path,
@@ -905,9 +923,14 @@ Comment Text:
                 # Process attachments for additional context
                 attachment_context = self.process_attachments(card_id)
 
-                # Execute as Claude Code instruction with full context
+                # Execute as Claude Code instruction with full context (continue existing session)
                 claude_instruction = f"Analyse the changes made in this git branch. Use this knowledge to process the following feedback.\n{comment_context}{attachment_context}"
-                claude_output = self.execute_claude_code(claude_instruction, worktree_path, card_state.get('session_id'))
+                claude_output = self.execute_claude_code(
+                    claude_instruction,
+                    worktree_path,
+                    card_state.get('session_id'),
+                    is_first_interaction=False
+                )
                 
                 # Commit and push
                 commit_output, _ = self.commit_and_push(
