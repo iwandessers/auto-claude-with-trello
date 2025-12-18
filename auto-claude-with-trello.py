@@ -770,7 +770,7 @@ Git Operations:
             attachment_context = self.process_attachments(card_id)
 
             # Continue existing session for comment processing
-            claude_instruction = f"Analyse the changes made in this git branch. Use this knowledge to process the following feedback.\n{comment_text}{attachment_context}"
+            claude_instruction = f"{comment_text}{attachment_context}"
             claude_output = self.execute_claude_code(
                 claude_instruction,
                 worktree_path,
