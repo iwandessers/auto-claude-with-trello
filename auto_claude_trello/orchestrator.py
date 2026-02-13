@@ -1086,7 +1086,7 @@ class Orchestrator:
             return
         finally:
             if self._executor:
-                self._executor.shutdown(wait=False)
+                self._executor.shutdown(wait=True)
 
         # Merge phase
         print("[ORCH] All subtasks reached terminal state. Starting merge…")
