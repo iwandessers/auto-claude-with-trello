@@ -117,7 +117,8 @@ python auto-claude-with-trello.py orchestrate --watch
               |
               v
     +-------------------+
-    | claude -p         |
+    | Delegate decomp   |
+    | to agent          |
     | "Decompose into   |
     |  3-8 subtasks..." |
     +---------+---------+
@@ -173,19 +174,35 @@ python auto-claude-with-trello.py orchestrate --watch
     +-------------------+                                     |
     | 2. Harvest done   |     for each finished agent:        |
     |    agents         |     - update SubTask status         |
-    +---------+---------+     - post result to Trello card    |
-              |                                               |
+    +---------+---------+     - push branch to remote         |
+              |               - post result to Trello card    |
               v                                               |
     +-------------------+                                     |
-    | 3. Re-plan on     |     ask Claude: retry / bridge /    |
-    |    failures       |     cancel downstream?              |
+    | 3. Re-plan on     |     delegate to agent: retry /      |
+    |    failures       |     bridge / cancel downstream?     |
     +---------+---------+                                     |
               |                                               |
               v                                               |
     +-------------------+                                     |
-    | 4. All terminal?  +----> YES -> exit loop -> MERGE      |
+    | 4. All terminal?  +---> NO  -> continue to step 5       |
     +---------+---------+                                     |
-              | NO                                            |
+              | YES                                           |
+              v                                               |
+    +-------------------+                                     |
+    | 4b. Reassess:     |     delegate review to agent        |
+    |     spawn review  |     (merges all completed branches  |
+    |     agent         |      in temp worktree, inspects)    |
+    +---------+---------+                                     |
+              |                                               |
+        critical issues?                                      |
+        /            \                                        |
+      YES            NO                                       |
+       |              |                                       |
+       v              v                                       |
+    create fix     exit loop -> MERGE                         |
+    subtasks,                                                 |
+    continue loop                                             |
+              |                                               |
               v                                               |
     +-------------------+                                     |
     | 5. Agent limit?   |     total_spawned >= ORCH_AGENT_    |
@@ -343,10 +360,12 @@ its own git worktree. Multiple sub-agents run in parallel (up to `--max-agents`)
     +--------+  +-----------+
     | Status:   | Status:     |
     | COMPLETE  | FAILED      |
-    | Post to   | Post error  |
-    | subtask   | to subtask  |
-    | Trello    | Trello card |
-    | card      | -> re-plan  |
+    | Push      | Post error  |
+    | branch to | to subtask  |
+    | remote,   | Trello card |
+    | post to   | -> delegate |
+    | Trello    |    re-plan  |
+    | card      |    to agent |
     +--------+  +-----------+
 
     Timeout: 900s default (--agent-timeout not yet exposed via CLI)

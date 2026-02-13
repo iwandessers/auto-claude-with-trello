@@ -1635,40 +1635,50 @@ class Orchestrator:
 
     def _decompose_task(self, card_name: str, card_desc: str,
                         attachments_info: str) -> List[SubTask]:
-        prompt = f"""You are a software architect. Decompose the following task into 3-8 independently executable subtasks for parallel coding agents.
+        """Delegate task decomposition to an agent."""
+        prompt = (
+            "You are a software architect. Decompose the following task "
+            "into 3-8 independently executable subtasks for parallel "
+            "coding agents.\n\n"
+            f"TASK TITLE: {card_name}\n\n"
+            f"TASK DESCRIPTION:\n{card_desc}\n\n"
+            f"{('ATTACHMENTS INFO:' + chr(10) + attachments_info + chr(10)) if attachments_info else ''}"
+            "Return ONLY a JSON array of subtask objects. Each object "
+            "must have these fields:\n"
+            '- "id": a short unique slug (e.g. "setup-auth")\n'
+            '- "title": concise subtask title\n'
+            '- "description": a complete, standalone prompt for a coding '
+            "agent — include ALL context needed so the agent can work "
+            "without seeing other subtasks\n"
+            '- "dependencies": list of other subtask titles this depends on '
+            "(empty list if none)\n"
+            '- "estimated_files": list of file paths this subtask will '
+            "likely touch\n"
+            '- "priority": integer (1 = highest). Same priority means '
+            "tasks can run in parallel.\n\n"
+            "Rules:\n"
+            "- Make each subtask independently implementable in its own "
+            "git branch\n"
+            "- Minimise file overlap between subtasks to avoid merge "
+            "conflicts\n"
+            "- Include concrete file paths and clear acceptance criteria "
+            "in each description\n"
+            "- Specify dependencies between subtasks by title\n"
+            "- Always include a final integration/testing subtask that "
+            "depends on all others\n"
+            "- Return ONLY the JSON array, no markdown fences, no "
+            "explanation"
+        )
 
-TASK TITLE: {card_name}
+        print("[ORCH] Delegating task decomposition to agent…")
+        result = _run_agent_in_worktree(
+            self.git.repo_path, prompt, timeout_seconds=300)
 
-TASK DESCRIPTION:
-{card_desc}
+        if not result['success']:
+            raise RuntimeError(
+                f"Decomposition agent failed: {result.get('error', '?')}")
 
-{('ATTACHMENTS INFO:' + chr(10) + attachments_info) if attachments_info else ''}
-
-Return ONLY a JSON array of subtask objects. Each object must have these fields:
-- "id": a short unique slug (e.g. "setup-auth")
-- "title": concise subtask title
-- "description": a complete, standalone prompt for a coding agent — include ALL context needed so the agent can work without seeing other subtasks
-- "dependencies": list of other subtask titles this depends on (empty list if none)
-- "estimated_files": list of file paths this subtask will likely touch
-- "priority": integer (1 = highest). Same priority means tasks can run in parallel.
-
-Rules:
-- Make each subtask independently implementable in its own git branch
-- Minimise file overlap between subtasks to avoid merge conflicts
-- Include concrete file paths and clear acceptance criteria in each description
-- Specify dependencies between subtasks by title
-- Always include a final integration/testing subtask that depends on all others
-- Return ONLY the JSON array, no markdown fences, no explanation"""
-
-        raw = self._call_claude(prompt)
-        subtasks = self._parse_subtasks_json(raw)
-        return subtasks
-
-    def _call_claude(self, prompt: str) -> str:
-        cmd = ['claude', '-p', prompt]
-        result = subprocess.run(cmd, capture_output=True, text=True,
-                                timeout=300)
-        return result.stdout.strip()
+        return self._parse_subtasks_json(result['output'])
 
     def _parse_subtasks_json(self, raw: str) -> List[SubTask]:
         # Strip markdown fences if present
@@ -1678,21 +1688,32 @@ Rules:
             lines = [l for l in lines if not l.strip().startswith("```")]
             cleaned = "\n".join(lines)
 
+        # Try to find a JSON array in the output
+        array_match = re.search(r'\[.*\]', cleaned, re.DOTALL)
+        if array_match:
+            cleaned = array_match.group()
+
         try:
             data = json.loads(cleaned)
         except json.JSONDecodeError:
-            # Ask Claude to fix it
+            # Delegate the fix to an agent
             fix_prompt = (
-                "The following text was supposed to be a JSON array of subtask "
-                "objects but it has syntax errors. Fix it and return ONLY the "
-                f"corrected JSON array, nothing else:\n\n{raw}"
+                "The following text was supposed to be a JSON array of "
+                "subtask objects but it has syntax errors. Fix it and "
+                "return ONLY the corrected JSON array, nothing else:"
+                f"\n\n{raw}"
             )
-            fixed_raw = self._call_claude(fix_prompt)
-            fixed = fixed_raw.strip()
+            fix_result = _run_agent_in_worktree(
+                self.git.repo_path, fix_prompt, timeout_seconds=120)
+            fixed = fix_result['output'].strip()
             if fixed.startswith("```"):
                 flines = fixed.split("\n")
-                flines = [l for l in flines if not l.strip().startswith("```")]
+                flines = [l for l in flines
+                          if not l.strip().startswith("```")]
                 fixed = "\n".join(flines)
+            array_match = re.search(r'\[.*\]', fixed, re.DOTALL)
+            if array_match:
+                fixed = array_match.group()
             data = json.loads(fixed)
 
         subtasks = []
@@ -1808,8 +1829,12 @@ Rules:
 
     def _replan_on_failure(self, state: OrchestratorState,
                            failed_task: Dict) -> List[SubTask]:
-        """Ask Claude whether to retry, add bridging tasks, or cancel
-        downstream dependents. Returns new SubTask objects (if any)."""
+        """Delegate re-planning to an agent when a subtask fails.
+
+        Spawns a short-lived agent that decides whether to retry, add
+        bridging tasks, or cancel downstream dependents.  Returns any
+        new SubTask objects that were created.
+        """
         completed = self._completed_titles(state)
         summary = (
             f"Completed tasks: {', '.join(completed) if completed else 'none'}\n"
@@ -1824,34 +1849,51 @@ Rules:
         ]
         summary += f"Pending tasks: {', '.join(pending) if pending else 'none'}\n"
 
-        prompt = f"""A subtask in an automated code orchestration failed.
+        prompt = (
+            f"A subtask in an automated code orchestration failed.\n\n"
+            f"{summary}\n"
+            f"Original parent task: {state.parent_card_name}\n\n"
+            f"Decide ONE of:\n"
+            f"1. RETRY — provide modified instructions for the failed task\n"
+            f"2. BRIDGE — provide 1-2 new bridging subtasks that work "
+            f"around the failure\n"
+            f"3. CANCEL — cancel all downstream dependents of the failed "
+            f"task\n\n"
+            f"Return ONLY a JSON object (no markdown fences) with:\n"
+            f'- "action": "retry" | "bridge" | "cancel"\n'
+            f'- "modified_instructions": string (only for retry)\n'
+            f'- "new_tasks": array of subtask objects (only for bridge). '
+            f'Each object needs: "id", "title", "description", '
+            f'"dependencies", "estimated_files", "priority"\n'
+            f'- "reason": brief explanation'
+        )
 
-{summary}
+        # Use the failed task's worktree if available so the agent can
+        # inspect the code state; fall back to the main repo.
+        agent_cwd = failed_task.get('worktree_path') or self.git.repo_path
+        print(f"[ORCH] Delegating re-plan for '{failed_task.get('title')}' "
+              f"to agent…")
+        replan_result = _run_agent_in_worktree(
+            agent_cwd, prompt, timeout_seconds=300)
 
-Original parent task: {state.parent_card_name}
+        if not replan_result['success']:
+            print(f"[ORCH] Re-plan agent failed — cancelling dependents.")
+            self._mark_blocked(state, failed_task.get('title', ''))
+            return []
 
-Decide ONE of:
-1. RETRY — provide modified instructions for the failed task
-2. BRIDGE — provide 1-2 new bridging subtasks that work around the failure
-3. CANCEL — cancel all downstream dependents of the failed task
-
-Return ONLY a JSON object with:
-- "action": "retry" | "bridge" | "cancel"
-- "modified_instructions": string (only for retry)
-- "new_tasks": array of subtask objects (only for bridge, same schema as decomposition)
-- "reason": brief explanation"""
-
-        raw = self._call_claude(prompt)
-        cleaned = raw.strip()
-        if cleaned.startswith("```"):
-            lines = cleaned.split("\n")
-            lines = [l for l in lines if not l.strip().startswith("```")]
-            cleaned = "\n".join(lines)
+        raw = replan_result['output'].strip()
+        json_match = re.search(r'\{.*\}', raw, re.DOTALL)
+        if not json_match:
+            print(f"[ORCH] Re-plan agent returned no JSON — "
+                  f"cancelling dependents.")
+            self._mark_blocked(state, failed_task.get('title', ''))
+            return []
 
         try:
-            decision = json.loads(cleaned)
+            decision = json.loads(json_match.group())
         except json.JSONDecodeError:
-            print(f"[ORCH] Could not parse re-plan response, cancelling dependents.")
+            print(f"[ORCH] Could not parse re-plan response, "
+                  f"cancelling dependents.")
             self._mark_blocked(state, failed_task.get('title', ''))
             return []
 
@@ -1973,6 +2015,20 @@ Return ONLY a JSON object with:
                                      completed_at=datetime.now().isoformat(),
                                      result_summary=result['output'][:500])
                 print(f"[ORCH] Agent completed: '{title}'")
+                # Push agent branch to remote
+                agent_branch = (subtask_dict.get('agent_branch')
+                                if isinstance(subtask_dict, dict)
+                                else subtask_dict.agent_branch)
+                agent_wt = (subtask_dict.get('worktree_path')
+                            if isinstance(subtask_dict, dict)
+                            else subtask_dict.worktree_path)
+                if agent_branch and agent_wt:
+                    try:
+                        self.git.push(agent_branch, cwd=agent_wt)
+                        print(f"[ORCH] Pushed branch {agent_branch}")
+                    except Exception as push_exc:
+                        print(f"[ORCH] Warning: failed to push "
+                              f"{agent_branch}: {push_exc}")
                 # Post result to subtask Trello card
                 card_id = (subtask_dict.get('card_id')
                            if isinstance(subtask_dict, dict)
@@ -2192,6 +2248,164 @@ Return ONLY a JSON object with:
             for s in state.subtasks
         )
 
+    # -- reassessment ---------------------------------------------------------
+
+    def _reassess_work(self, state: OrchestratorState) -> bool:
+        """Delegate a review of all completed work to an agent.
+
+        Spawns a review agent in a temporary worktree that merges every
+        completed branch, inspects the combined result, and reports
+        whether there are VERY CRITICAL problems.
+
+        Returns True if critical issues were found (new subtasks added
+        to *state*), False if the work is acceptable.
+        """
+        completed = [
+            s for s in state.subtasks
+            if (s.get('status') if isinstance(s, dict) else s.status)
+            == TaskStatus.COMPLETE.value
+        ]
+        if not completed:
+            return False
+
+        # Build a temp worktree with all completed branches merged in
+        review_branch = (f"orch/review-{state.orchestrator_id[:8]}-"
+                         f"{str(uuid.uuid4())[:4]}")
+        self.git.fetch()
+        self.git.create_branch(review_branch, state.parent_branch)
+        review_wt = self.git.create_worktree(review_branch,
+                                             f"review-{state.orchestrator_id[:8]}")
+
+        for sd in completed:
+            branch = (sd.get('agent_branch') if isinstance(sd, dict)
+                      else sd.agent_branch)
+            if branch:
+                subprocess.run(
+                    ['git', 'merge', '--no-ff', '-m',
+                     f'Review merge {branch}', branch],
+                    cwd=review_wt, capture_output=True)
+                # If conflicts, just accept theirs so the agent can still see
+                # the code even if imperfect
+                if self.git.has_conflicts(cwd=review_wt):
+                    subprocess.run(['git', 'checkout', '--theirs', '.'],
+                                   cwd=review_wt, capture_output=True)
+                    self.git.commit_all(
+                        f"Auto-resolved conflicts for review of {branch}",
+                        cwd=review_wt)
+
+        # Gather subtask summaries for the review prompt
+        summary_lines = []
+        for sd in completed:
+            s = sd if isinstance(sd, dict) else asdict(sd)
+            summary_lines.append(
+                f"- {s['title']}: branch={s.get('agent_branch','?')}, "
+                f"files={', '.join(s.get('estimated_files', []))}"
+            )
+        summaries = "\n".join(summary_lines)
+
+        review_prompt = (
+            f"You are a senior code reviewer. You are inside a git worktree "
+            f"that contains the merged output of several coding agents.\n\n"
+            f"## Parent Task\n{state.parent_card_name}\n\n"
+            f"## Completed Subtasks\n{summaries}\n\n"
+            f"## Your Job\n"
+            f"1. Use `git log --oneline` and `git diff HEAD~{len(completed)}` "
+            f"to inspect what the agents changed.\n"
+            f"2. Look for VERY CRITICAL problems ONLY:\n"
+            f"   - Broken imports or syntax errors that prevent the project "
+            f"from running\n"
+            f"   - Security vulnerabilities (credentials leaked, SQL injection, "
+            f"etc.)\n"
+            f"   - Completely missing implementations (function stubs left empty "
+            f"when they should have been filled)\n"
+            f"   - Logic that is the exact opposite of what was requested\n"
+            f"3. Do NOT flag style issues, minor bugs, missing tests, or "
+            f"improvements. Those are not critical.\n\n"
+            f"## Output\n"
+            f"Return ONLY a JSON object (no markdown fences):\n"
+            f'{{"critical": false}} if no very critical problems were found.\n'
+            f"OR\n"
+            f'{{"critical": true, "issues": ['
+            f'{{"title": "short-slug", '
+            f'"description": "Complete standalone prompt for a coding agent '
+            f'to fix this issue. Include file paths and exact problem.", '
+            f'"estimated_files": ["path/to/file"], '
+            f'"priority": 1}}]}}\n'
+            f"Remember: only VERY CRITICAL issues. When in doubt, it is fine."
+        )
+
+        print("[ORCH] Delegating post-execution review to agent…")
+        review_result = _run_agent_in_worktree(
+            review_wt, review_prompt, timeout_seconds=300)
+
+        # Clean up review worktree
+        self.git.remove_worktree(review_wt)
+        # Also delete the temp review branch
+        subprocess.run(['git', 'branch', '-D', review_branch],
+                       cwd=self.git.repo_path, capture_output=True)
+
+        if not review_result['success']:
+            print("[ORCH] Review agent failed — proceeding to merge anyway.")
+            return False
+
+        # Parse the review agent's output
+        raw = review_result['output'].strip()
+        # Try to extract JSON from the output (agent may add commentary)
+        json_match = re.search(r'\{.*\}', raw, re.DOTALL)
+        if not json_match:
+            print("[ORCH] Review agent returned no JSON — "
+                  "proceeding to merge.")
+            return False
+
+        try:
+            verdict = json.loads(json_match.group())
+        except json.JSONDecodeError:
+            print("[ORCH] Review agent returned invalid JSON — "
+                  "proceeding to merge.")
+            return False
+
+        if not verdict.get('critical', False):
+            print("[ORCH] Review passed — no critical issues found.")
+            return False
+
+        # Critical issues found — create new subtasks
+        issues = verdict.get('issues', [])
+        if not issues:
+            print("[ORCH] Review flagged critical but gave no issues — "
+                  "proceeding to merge.")
+            return False
+
+        print(f"[ORCH] Review found {len(issues)} critical issue(s). "
+              f"Creating fix subtasks…")
+        for item in issues:
+            fix_id = f"fix-{item.get('title', str(uuid.uuid4())[:6])}"
+            fix_st = SubTask(
+                id=fix_id,
+                title=item.get('title', fix_id),
+                description=item['description'],
+                dependencies=[],
+                estimated_files=item.get('estimated_files', []),
+                priority=item.get('priority', 1),
+            )
+            state.subtasks.append(asdict(fix_st))
+
+            if state.subtask_list_id:
+                try:
+                    card = self.trello.create_card(
+                        state.subtask_list_id, fix_st.title,
+                        fix_st.description)
+                    self._update_subtask(state, fix_id, card_id=card['id'])
+                except Exception:
+                    pass
+
+        self._post_status(
+            state,
+            extra=(f"**Post-execution review found {len(issues)} critical "
+                   f"issue(s).** Spawning fix agents…")
+        )
+        self._save_state(state)
+        return True
+
     # -- main orchestration loop ----------------------------------------------
 
     def orchestrate(self, card_id: str):
@@ -2286,6 +2500,13 @@ Return ONLY a JSON object with:
 
                 # 4. Check if all tasks reached terminal state
                 if self._all_terminal(state):
+                    # Reassess: delegate a review to an agent.
+                    # If VERY CRITICAL issues are found, new fix
+                    # subtasks are added and the loop continues.
+                    if self._reassess_work(state):
+                        print("[ORCH] Critical fixes queued — "
+                              "continuing execution loop.")
+                        continue
                     break
 
                 # 5. Start ready agents (fill available slots)
