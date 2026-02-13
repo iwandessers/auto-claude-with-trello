@@ -16,6 +16,10 @@ Environment Variables Required:
 - TRELLO_ORCHESTRATOR_LIST_ID: Trello list ID that triggers orchestration.
   Drop a card onto this list to decompose it into subtasks and execute them
   in parallel via multiple Claude Code agents. Move the card off the list to stop.
+- ORCH_AGENT_LIMIT: Maximum number of agents the orchestrator may spawn before
+  pausing for human approval (default: 10). Once hit, the orchestrator posts a
+  comment on the parent Trello card and waits for someone to reply "continue"
+  before it will spawn any further agents.
 
 To create a BitBucket repository access token:
 1. Go to BitBucket → Personal settings → App passwords
@@ -51,6 +55,7 @@ TRELLO_TOKEN = os.getenv('TRELLO_TOKEN')
 TRELLO_BOARD_ID = os.getenv('TRELLO_BOARD_ID')
 TRELLO_LIST_ID = os.getenv('TRELLO_LIST_ID')
 TRELLO_ORCHESTRATOR_LIST_ID = os.getenv('TRELLO_ORCHESTRATOR_LIST_ID')
+ORCH_AGENT_LIMIT = int(os.getenv('ORCH_AGENT_LIMIT', '10'))
 
 BITBUCKET_ACCESS_TOKEN = os.getenv('BITBUCKET_ACCESS_TOKEN')
 BITBUCKET_WORKSPACE = os.getenv('BITBUCKET_WORKSPACE')
@@ -1287,6 +1292,13 @@ class TrelloAPI:
         resp = requests.post(url, params=params, timeout=30)
         resp.raise_for_status()
 
+    def get_card_comments(self, card_id: str) -> List[Dict]:
+        url = f"{self.BASE}/cards/{card_id}/actions"
+        params = {**self.auth, 'filter': 'commentCard'}
+        resp = requests.get(url, params=params, timeout=30)
+        resp.raise_for_status()
+        return resp.json()
+
     def move_card(self, card_id: str, list_id: str):
         url = f"{self.BASE}/cards/{card_id}"
         params = {**self.auth, 'idList': list_id}
@@ -1446,6 +1458,8 @@ class Orchestrator:
         self.agent_timeout = agent_timeout
         self.debug = debug
         self._stop_requested = False
+        self._paused = False          # True when agent limit reached
+        self._pause_comment_id: Optional[str] = None  # comment ID of pause notice
         self._executor: Optional[concurrent.futures.ProcessPoolExecutor] = None
         # future -> subtask id
         self._futures: Dict[concurrent.futures.Future, str] = {}
@@ -1496,6 +1510,72 @@ class Orchestrator:
                 return True
         except Exception as exc:
             print(f"[ORCH] Warning: could not check card list: {exc}")
+        return False
+
+    # -- agent limit / human approval gate ------------------------------------
+
+    def _check_agent_limit(self, state: OrchestratorState) -> bool:
+        """Return True if the orchestrator is paused waiting for approval.
+
+        When ``total_agents_spawned`` reaches ``ORCH_AGENT_LIMIT``, the
+        orchestrator posts a comment on the parent card asking for human
+        approval and refuses to start new agents until it sees a reply
+        containing the word "continue".
+        """
+        if self._paused:
+            return not self._has_human_continue(state)
+
+        if state.total_agents_spawned >= ORCH_AGENT_LIMIT:
+            self._paused = True
+            msg = (
+                f"## {self.BOT_TAG} Agent Limit Reached\n\n"
+                f"The orchestrator has spawned **{state.total_agents_spawned}** "
+                f"agents (limit: **{ORCH_AGENT_LIMIT}**).\n\n"
+                f"No new agents will be started until a human replies to this "
+                f"card with a comment containing the word **continue**.\n\n"
+                f"Already-running agents will keep executing."
+            )
+            try:
+                self.trello.add_comment(state.parent_card_id, msg)
+                # Grab the ID of the comment we just posted so we only look
+                # at replies that arrive *after* it.
+                comments = self.trello.get_card_comments(state.parent_card_id)
+                for c in comments:
+                    text = c.get('data', {}).get('text', '')
+                    if 'Agent Limit Reached' in text:
+                        self._pause_comment_id = c['id']
+                        break
+            except Exception as exc:
+                print(f"[ORCH] Warning: could not post pause comment: {exc}")
+            print(f"[ORCH] Paused — waiting for human 'continue' comment "
+                  f"(limit {ORCH_AGENT_LIMIT} reached).")
+            return True
+
+        return False
+
+    def _has_human_continue(self, state: OrchestratorState) -> bool:
+        """Check if a human has posted a comment containing 'continue'
+        after the pause notice."""
+        try:
+            comments = self.trello.get_card_comments(state.parent_card_id)
+        except Exception:
+            return False
+
+        # Comments are returned newest-first.  We scan until we hit the
+        # pause comment (or the list is exhausted).
+        for c in comments:
+            cid = c['id']
+            if cid == self._pause_comment_id:
+                break  # nothing newer contains "continue"
+            text = c.get('data', {}).get('text', '')
+            # Ignore bot's own comments
+            if self.BOT_TAG in text:
+                continue
+            if re.search(r'\bcontinue\b', text, re.IGNORECASE):
+                print("[ORCH] Human approved continuation — resuming.")
+                self._paused = False
+                self._pause_comment_id = None
+                return True
         return False
 
     # -- status comments ------------------------------------------------------
@@ -2207,18 +2287,20 @@ Return ONLY a JSON object with:
                     break
 
                 # 5. Start ready agents (fill available slots)
-                running_count = sum(
-                    1 for s in state.subtasks
-                    if (s.get('status') if isinstance(s, dict) else s.status)
-                    == TaskStatus.RUNNING.value
-                )
-                available_slots = self.max_agents - running_count
-                ready = self._ready_subtasks(state)
+                #    Skip if paused waiting for human approval.
+                if not self._check_agent_limit(state):
+                    running_count = sum(
+                        1 for s in state.subtasks
+                        if (s.get('status') if isinstance(s, dict) else s.status)
+                        == TaskStatus.RUNNING.value
+                    )
+                    available_slots = self.max_agents - running_count
+                    ready = self._ready_subtasks(state)
 
-                for sd in ready[:available_slots]:
-                    s = sd if isinstance(sd, dict) else asdict(sd)
-                    self._start_agent(state, s)
-                    self._save_state(state)
+                    for sd in ready[:available_slots]:
+                        s = sd if isinstance(sd, dict) else asdict(sd)
+                        self._start_agent(state, s)
+                        self._save_state(state)
 
                 # 6. Post status every 5 cycles
                 if cycle % 5 == 0:
